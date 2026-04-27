@@ -1,0 +1,308 @@
+---
+title: "Router: connecting subscribers to handlers"
+description: "The Router connects subscribers to handler functions, handles Ack/Nack automatically, runs middleware chains, and shuts down gracefully."
+---
+
+Publishers and subscribers are low-level primitives. In production you almost always want higher-level features: automatic Ack/Nack based on handler errors, retries, correlation IDs, metrics, and graceful shutdown. The `Router` provides all of this and more.
+
+Without the Router, you write a manual `for msg := range messages` loop, call `msg.Ack()` or `msg.Nack()` yourself, and wire middleware by hand. With the Router, you register a handler function and let the infrastructure take care of the rest.
+
+## Configuration
+
+```go
+// RouterConfig holds the Router's configuration options.
+type RouterConfig struct {
+    // CloseTimeout determines how long the router waits for handlers
+    // to finish processing when shutting down.
+    CloseTimeout time.Duration
+}
+```
+
+The only configuration field is `CloseTimeout`. It defaults to 30 seconds when not set. When `Close()` is called, the Router stops accepting new messages and waits up to this duration for in-flight handlers to complete.
+
+## Creating a router
+
+<Steps>
+  <Step title="Construct the router">
+    ```go
+    import (
+        "github.com/ThreeDotsLabs/watermill"
+        "github.com/ThreeDotsLabs/watermill/message"
+    )
+
+    logger := watermill.NewStdLogger(false, false)
+
+    // NewRouter returns an error if the config is invalid.
+    router, err := message.NewRouter(message.RouterConfig{}, logger)
+    if err != nil {
+        panic(err)
+    }
+    ```
+
+    Or use the convenience constructor that never returns an error:
+
+    ```go
+    // NewDefaultRouter creates a Router with default configuration.
+    router := message.NewDefaultRouter(logger)
+    ```
+  </Step>
+
+  <Step title="Add router-level middleware">
+    Middleware added to the router runs for every handler registered on it.
+
+    ```go
+    router.AddMiddleware(
+        middleware.CorrelationID,
+        middleware.Retry{
+            MaxRetries:      3,
+            InitialInterval: time.Millisecond * 100,
+            Logger:          logger,
+        }.Middleware,
+        middleware.Recoverer,
+    )
+    ```
+  </Step>
+
+  <Step title="Register handlers">
+    ```go
+    // AddHandler registers a handler that reads from subscribeTopic
+    // and publishes returned messages to publishTopic.
+    handler := router.AddHandler(
+        "struct_handler",          // unique handler name
+        "incoming_messages_topic", // topic to subscribe to
+        pubSub,                    // subscriber implementation
+        "outgoing_messages_topic", // topic to publish results to
+        pubSub,                    // publisher implementation
+        structHandler{}.Handler,   // handler function
+    )
+    ```
+  </Step>
+
+  <Step title="Run the router">
+    ```go
+    ctx := context.Background()
+    // Run is blocking until the router stops.
+    if err := router.Run(ctx); err != nil {
+        panic(err)
+    }
+    ```
+  </Step>
+</Steps>
+
+## Handler types
+
+### AddHandler — transform and publish
+
+Use `AddHandler` when your handler consumes messages from one topic and publishes results to another.
+
+```go
+// AddHandler adds a new handler.
+//
+// handlerName must be unique. Used for debugging.
+//
+// subscribeTopic is the topic from which the handler will receive messages.
+//
+// publishTopic is the topic to which the router will publish messages
+// returned by handlerFunc.
+//
+// If the handler is added while the router is already running, call RunHandlers().
+func (r *Router) AddHandler(
+    handlerName string,
+    subscribeTopic string,
+    subscriber Subscriber,
+    publishTopic string,
+    publisher Publisher,
+    handlerFunc HandlerFunc,
+) *Handler
+```
+
+`HandlerFunc` returns a slice of messages to publish and an error:
+
+```go
+// HandlerFunc is called when a message is received.
+//
+// msg.Ack() is called automatically when HandlerFunc returns nil.
+// msg.Nack() is called when HandlerFunc returns an error.
+type HandlerFunc func(msg *Message) ([]*Message, error)
+```
+
+### AddConsumerHandler — consume only
+
+Use `AddConsumerHandler` (formerly `AddNoPublisherHandler`) when your handler only consumes and does not need to publish anything.
+
+```go
+// AddConsumerHandler adds a handler that does not return any messages.
+// It can still publish by directly using a Publisher injected as a dependency.
+func (r *Router) AddConsumerHandler(
+    handlerName string,
+    subscribeTopic string,
+    subscriber Subscriber,
+    handlerFunc NoPublishHandlerFunc,
+) *Handler
+```
+
+`NoPublishHandlerFunc` returns only an error:
+
+```go
+// NoPublishHandlerFunc is a HandlerFunc alternative that produces no messages.
+type NoPublishHandlerFunc func(msg *Message) error
+```
+
+## Full example
+
+The following is the complete router example from the Watermill repository:
+
+```go
+func main() {
+    logger := watermill.NewStdLogger(false, false)
+
+    router, err := message.NewRouter(message.RouterConfig{}, logger)
+    if err != nil {
+        panic(err)
+    }
+
+    // SignalsHandler gracefully shuts down the Router on SIGTERM.
+    router.AddPlugin(plugin.SignalsHandler)
+
+    router.AddMiddleware(
+        middleware.CorrelationID,
+        middleware.Retry{
+            MaxRetries:      3,
+            InitialInterval: time.Millisecond * 100,
+            Logger:          logger,
+        }.Middleware,
+        middleware.Recoverer,
+    )
+
+    pubSub := gochannel.NewGoChannel(gochannel.Config{}, logger)
+    go publishMessages(pubSub)
+
+    // AddHandler returns a *Handler that you can add handler-level middleware to.
+    handler := router.AddHandler(
+        "struct_handler",
+        "incoming_messages_topic",
+        pubSub,
+        "outgoing_messages_topic",
+        pubSub,
+        structHandler{}.Handler,
+    )
+
+    // Handler-level middleware runs only for this handler.
+    handler.AddMiddleware(func(h message.HandlerFunc) message.HandlerFunc {
+        return func(message *message.Message) ([]*message.Message, error) {
+            log.Println("executing handler specific middleware for ", message.UUID)
+            return h(message)
+        }
+    })
+
+    router.AddConsumerHandler(
+        "print_outgoing_messages",
+        "outgoing_messages_topic",
+        pubSub,
+        printMessages,
+    )
+
+    ctx := context.Background()
+    if err := router.Run(ctx); err != nil {
+        panic(err)
+    }
+}
+```
+
+## Automatic Ack/Nack
+
+The Router manages acknowledgements for you:
+
+- If your `HandlerFunc` returns `nil`, the Router calls `msg.Ack()`.
+- If your `HandlerFunc` returns an error, the Router calls `msg.Nack()`.
+- If you call `msg.Ack()` manually inside the handler and then return an error, the Router will not send a second `Nack()` because it detects the Ack was already sent.
+
+## Middleware
+
+Middleware is added with `AddMiddleware` on the router (runs for all handlers) or on a specific `*Handler` (runs only for that handler):
+
+```go
+// AddMiddleware adds middleware to the router (router-level).
+// The order of middleware matters. Middleware added first is executed first.
+func (r *Router) AddMiddleware(m ...HandlerMiddleware)
+
+// AddMiddleware adds middleware to an individual handler (handler-level).
+func (h *Handler) AddMiddleware(m ...HandlerMiddleware)
+```
+
+## Lifecycle
+
+### Run
+
+```go
+// Run runs all plugins and handlers and starts subscribing to provided topics.
+// This call is blocking while the router is running.
+//
+// When all handlers have stopped (e.g. subscriptions were closed), the router stops too.
+//
+// To stop Run() you should call Close() on the router.
+//
+// ctx will be propagated to all subscribers.
+func (r *Router) Run(ctx context.Context) (err error)
+```
+
+### Waiting until the router is ready
+
+Because `Run` is blocking you'll typically launch it in a goroutine and then wait for the router to be ready before sending messages:
+
+```go
+go router.Run(ctx)
+<-router.Running() // blocks until the router is fully started
+```
+
+```go
+// Running is closed when the router is running.
+func (r *Router) Running() chan struct{}
+
+// IsRunning returns true when the router is running.
+func (r *Router) IsRunning() bool
+```
+
+### Close
+
+```go
+// Close gracefully closes the router with the timeout from RouterConfig.CloseTimeout.
+func (r *Router) Close() error
+```
+
+`Close()` stops all subscribers, waits for in-flight handlers to finish (up to `CloseTimeout`), and then returns. If the timeout is reached, it returns an error.
+
+### Adding handlers to a running router
+
+You can add handlers after `Run` has been called, then call `RunHandlers` to activate them:
+
+```go
+// RunHandlers runs all handlers that were added after Run().
+// RunHandlers is idempotent, so it can be called multiple times safely.
+func (r *Router) RunHandlers(ctx context.Context) error
+```
+
+### Stopping a single handler
+
+```go
+// Stop stops a specific handler asynchronously.
+// The router will close when all handlers have stopped.
+func (h *Handler) Stop()
+
+// Stopped returns a channel that is closed when the handler stops.
+func (h *Handler) Stopped() chan struct{}
+```
+
+## Message context values
+
+The Router adds the following values to each message's context, accessible via helper functions:
+
+```go
+message.HandlerNameFromCtx(msg.Context())     // the handler's name
+message.PublisherNameFromCtx(msg.Context())   // the publisher type name
+message.SubscriberNameFromCtx(msg.Context())  // the subscriber type name
+message.SubscribeTopicFromCtx(msg.Context())  // the subscribed topic
+message.PublishTopicFromCtx(msg.Context())    // the publish topic
+```
+
+These are useful in middleware and logging, and are used internally by the `PoisonQueue` middleware to annotate poisoned messages.

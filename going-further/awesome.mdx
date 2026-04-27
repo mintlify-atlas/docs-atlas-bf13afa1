@@ -1,0 +1,123 @@
+---
+title: "Community libraries and integrations"
+description: "A curated list of unofficial Pub/Sub backends, logging adapters, observability integrations, and code generators built by the community."
+---
+
+The Watermill ecosystem extends well beyond the official backends maintained by Three Dots Labs. Below is a list of community-maintained libraries that add support for additional brokers, logging frameworks, observability tools, and more.
+
+<Warning>
+These libraries are not maintained by Three Dots Labs. Three Dots Labs cannot provide support or guarantee they work correctly. Do your own research before using them in production.
+</Warning>
+
+## Pub/Sub backends
+
+The following libraries add support for messaging systems not covered by the official implementations.
+
+<CardGroup cols={2}>
+  <Card title="AMQP 1.0" href="https://github.com/kahowell/watermill-amqp10">
+    AMQP 1.0 protocol support (distinct from the official AMQP 0-9-1 / RabbitMQ implementation).
+  </Card>
+  <Card title="Apache Pulsar" href="https://github.com/AlexCuse/watermill-pulsar">
+    Apache Pulsar backend for Watermill.
+  </Card>
+  <Card title="Apache RocketMQ" href="https://github.com/yflau/watermill-rocketmq">
+    Apache RocketMQ backend for Watermill.
+  </Card>
+  <Card title="CockroachDB" href="https://github.com/cockroachdb/watermill-crdb">
+    CockroachDB-based Pub/Sub, maintained by the CockroachDB team.
+  </Card>
+  <Card title="Ensign" href="https://github.com/rotationalio/watermill-ensign">
+    Ensign managed event streaming backend.
+  </Card>
+  <Card title="Google Cloud Pub/Sub HTTP Push" href="https://github.com/dentech-floss/watermill-googlecloud-http">
+    Google Cloud Pub/Sub using HTTP push subscriptions instead of pull.
+  </Card>
+  <Card title="MongoDB" href="https://github.com/cunyat/watermill-mongodb">
+    MongoDB-backed Pub/Sub using change streams or capped collections.
+  </Card>
+  <Card title="MQTT" href="https://github.com/perfect13/watermill-mqtt">
+    MQTT protocol support for IoT and lightweight messaging scenarios.
+  </Card>
+  <Card title="NSQ" href="https://github.com/chennqqi/watermill-nsq">
+    NSQ distributed messaging platform backend.
+  </Card>
+  <Card title="Redis Zset" href="https://github.com/stong1994/watermill-rediszset">
+    Redis sorted-set-based Pub/Sub for ordered message delivery.
+  </Card>
+  <Card title="SQLite" href="https://github.com/davidroman0O/watermill-comfymill">
+    SQLite-backed Pub/Sub for embedded or offline-first applications.
+  </Card>
+</CardGroup>
+
+<Note>
+If you want to build your own backend, see [Implementing a custom Pub/Sub backend](/going-further/custom-pubsub) for the interface contracts and test suite.
+</Note>
+
+## Logging adapters
+
+Watermill's `LoggerAdapter` interface makes it straightforward to route logs to any framework.
+
+### logrus
+
+- https://github.com/ma-hartma/watermill-logrus-adapter
+- https://github.com/UNIwise/walrus
+
+### logur
+
+- https://github.com/logur/integration-watermill
+
+### zap
+
+- https://github.com/garsue/watermillzap
+- https://github.com/pperaltaisern/watermillzap
+
+### zerolog
+
+- https://github.com/alexdrl/zerowater
+- https://github.com/bogatyr285/watermillzlog
+- https://github.com/vsvp21/zerolog-watermill-adapter
+
+## Observability
+
+### OpenCensus
+
+- https://github.com/czeslavo/watermill-opencensus
+- https://github.com/sagikazarmark/ocwatermill
+
+### OpenTelemetry
+
+<CardGroup cols={2}>
+  <Card title="watermill-opentelemetry" href="https://github.com/voi-oss/watermill-opentelemetry">
+    General OpenTelemetry tracing and metrics middleware.
+  </Card>
+  <Card title="watermill-opentelemetry-go-extra" href="https://github.com/dentech-floss/watermill-opentelemetry-go-extra">
+    Extended OpenTelemetry integration with additional instrumentation hooks.
+  </Card>
+  <Card title="nkonev/watermill-opentelemetry" href="https://github.com/nkonev/watermill-opentelemetry">
+    Alternative OpenTelemetry adapter.
+  </Card>
+  <Card title="otel-watermill-amqp" href="https://github.com/hpcslag/otel-watermill-amqp">
+    OpenTelemetry tracing specifically for the AMQP backend.
+  </Card>
+  <Card title="watermill-otel-tracable-gochannel" href="https://github.com/hpcslag/watermill-otel-tracable-gochannel">
+    Traceable GoChannel for in-process OpenTelemetry instrumentation.
+  </Card>
+</CardGroup>
+
+## Other tools
+
+- **AsyncAPI template** — Generate AsyncAPI specs from Watermill services: https://github.com/asyncapi/go-watermill-template
+- **watermillx** — Extensions and utilities for Watermill: https://github.com/goph/watermillx
+- **protoc-gen-event** — Protobuf plugin that generates Watermill event handlers: https://github.com/voi-oss/protoc-gen-event
+
+## Example projects
+
+Community-contributed example applications showing Watermill patterns in practice:
+
+- https://github.com/minghsu0107/golang-taipei-watermill-example
+- https://github.com/minghsu0107/Kafka-PubSub
+- https://github.com/pperaltaisern/go-example-financing
+
+## Adding your library
+
+If you have built a Watermill integration and want it listed here, [open a pull request](https://github.com/ThreeDotsLabs/watermill/edit/master/docs/content/docs/awesome.md) editing the upstream source file.

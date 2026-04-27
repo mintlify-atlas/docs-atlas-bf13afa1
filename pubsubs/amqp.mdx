@@ -1,0 +1,171 @@
+---
+title: "RabbitMQ (AMQP) backend for Watermill"
+description: "Connect Watermill to RabbitMQ using the official amqp091-go library. Configure durable queues, exchanges, consumer groups, and transient subscriptions."
+---
+
+RabbitMQ is the most widely deployed open source message broker. It implements the AMQP 0-9-1 protocol and is well suited for scenarios that require flexible routing, durable queues, and acknowledged delivery. The Watermill AMQP adapter is built on the official [`rabbitmq/amqp091-go`](https://github.com/rabbitmq/amqp091-go) library.
+
+<Note>
+This backend lives in a separate module: [`github.com/ThreeDotsLabs/watermill-amqp`](https://github.com/ThreeDotsLabs/watermill-amqp). You need to install it in addition to the core `watermill` package.
+</Note>
+
+## Installation
+
+```bash
+go get github.com/ThreeDotsLabs/watermill-amqp/v3
+```
+
+## Characteristics
+
+| Feature               | Supported | Notes                                                                                                             |
+|-----------------------|-----------|-------------------------------------------------------------------------------------------------------------------|
+| ConsumerGroups        | yes\*     | No native consumer groups in AMQP, but achieved via `GenerateQueueNameTopicNameWithSuffix`. See [Consumer Groups](#amqp-consumer-groups). |
+| ExactlyOnceDelivery   | no        |                                                                                                                   |
+| GuaranteedOrder       | yes       | See [RabbitMQ ordering semantics](https://www.rabbitmq.com/semantics.html#ordering)                               |
+| Persistent            | yes\*     | Use `NewDurablePubSubConfig` or `NewDurableQueueConfig`                                                           |
+
+## Configuration
+
+Watermill ships with pre-built config helpers for the most common use cases:
+
+```go
+// NewDurablePubSubConfig creates a durable fan-out configuration.
+// Each subscriber gets its own queue named after the topic + suffix.
+func NewDurablePubSubConfig(amqpURI string, generateQueueName GenerateQueueNameFn) Config
+
+// NewDurableQueueConfig creates a durable point-to-point queue configuration.
+// All subscribers on the same queue share work.
+func NewDurableQueueConfig(amqpURI string) Config
+
+// NewNonDurablePubSubConfig creates a transient fan-out configuration.
+func NewNonDurablePubSubConfig(amqpURI string, generateQueueName GenerateQueueNameFn) Config
+```
+
+For advanced use cases the full `Config` struct gives you control over exchange type, queue durability, bindings and TLS. See [watermill-amqp/pkg/amqp/config.go](https://github.com/ThreeDotsLabs/watermill-amqp/tree/master/pkg/amqp/config.go) for all fields.
+
+### TLS
+
+Pass a `*tls.Config` via `Config.TLSConfig` to enable TLS connections to RabbitMQ.
+
+## Publisher setup
+
+```go
+import (
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-amqp/v3/pkg/amqp"
+)
+
+amqpConfig := amqp.NewDurablePubSubConfig(
+    "amqp://guest:guest@localhost:5672/",
+    nil, // use default queue name generator
+)
+
+publisher, err := amqp.NewPublisher(amqpConfig, watermill.NewStdLogger(false, false))
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+```
+
+## Subscriber setup
+
+```go
+amqpConfig := amqp.NewDurablePubSubConfig(
+    "amqp://guest:guest@localhost:5672/",
+    amqp.GenerateQueueNameTopicNameWithSuffix("my-service"),
+)
+
+subscriber, err := amqp.NewSubscriber(amqpConfig, watermill.NewStdLogger(false, false))
+if err != nil {
+    panic(err)
+}
+defer subscriber.Close()
+```
+
+## Usage example
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-amqp/v3/pkg/amqp"
+    "github.com/ThreeDotsLabs/watermill/message"
+)
+
+const amqpURI = "amqp://guest:guest@localhost:5672/"
+
+func main() {
+    logger := watermill.NewStdLogger(false, false)
+
+    publisher, err := amqp.NewPublisher(
+        amqp.NewDurablePubSubConfig(amqpURI, nil),
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer publisher.Close()
+
+    subscriber, err := amqp.NewSubscriber(
+        amqp.NewDurablePubSubConfig(amqpURI,
+            amqp.GenerateQueueNameTopicNameWithSuffix("svc-a"),
+        ),
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer subscriber.Close()
+
+    msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"order_placed"}`))
+    if err := publisher.Publish("orders", msg); err != nil {
+        panic(err)
+    }
+
+    messages, err := subscriber.Subscribe(context.Background(), "orders")
+    if err != nil {
+        panic(err)
+    }
+
+    for msg := range messages {
+        fmt.Printf("Received: %s\n", msg.Payload)
+        msg.Ack()
+    }
+}
+```
+
+## AMQP consumer groups
+
+AMQP does not have a concept identical to Kafka's consumer groups. You can replicate the behaviour by giving each independent service its own queue using `GenerateQueueNameTopicNameWithSuffix`:
+
+```go
+func createSubscriber(suffix string) (*amqp.Subscriber, error) {
+    cfg := amqp.NewDurablePubSubConfig(
+        "amqp://guest:guest@localhost:5672/",
+        amqp.GenerateQueueNameTopicNameWithSuffix(suffix),
+    )
+    return amqp.NewSubscriber(cfg, watermill.NewStdLogger(false, false))
+}
+
+sub1, _ := createSubscriber("service-a")
+sub2, _ := createSubscriber("service-b")
+
+// Both subscribers receive every message independently
+messages1, _ := sub1.Subscribe(ctx, "events")
+messages2, _ := sub2.Subscribe(ctx, "events")
+```
+
+## Topology builder
+
+The `TopologyBuilder` interface lets you fully customise how exchanges, queues and bindings are declared at connection time. Implement it and assign it to `Config.TopologyBuilder` when you need non-standard exchange types or binding configurations.
+
+## Key considerations
+
+- **Durability** — use `NewDurablePubSubConfig` or `NewDurableQueueConfig` to ensure messages survive broker restarts.
+- **Acknowledged delivery** — messages are re-queued on Nack; design consumers to handle redelivery.
+- **Ordered delivery** — guaranteed within a single queue by RabbitMQ's semantics.
+- **Examples** — see the [Watermill AMQP example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/pubsubs/amqp) for a runnable demo.

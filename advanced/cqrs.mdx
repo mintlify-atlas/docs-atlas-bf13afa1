@@ -1,0 +1,493 @@
+---
+title: "CQRS component for event-driven Go apps"
+description: "Build CQRS and event-driven applications using typed Go structs instead of raw messages, with separate buses and processors for commands and events."
+---
+
+The CQRS component provides a high-level API on top of Watermill's Pub/Sub and router primitives. Instead of working directly with `message.Message`, you define plain Go structs for commands and events and register typed handlers. The component handles marshaling, topic generation, and routing automatically.
+
+You don't need to implement the full CQRS pattern. It's common to use only the event side to build event-driven applications without commands.
+
+## What is CQRS?
+
+CQRS — Command Query Responsibility Segregation — separates write operations (commands) from read operations (queries). Commands express intent to change state; events record that a change occurred. Handlers are responsible only for one side, making them easier to reason about and test independently.
+
+## Quick example
+
+Publish an event from anywhere in your application:
+
+```go
+err := eventBus.Publish(ctx, &UserRegistered{
+    UserID:   id,
+    Email:    email,
+    JoinedAt: time.Now(),
+})
+```
+
+Register a typed handler that receives the struct directly:
+
+```go
+eventProcessor.AddHandlers(
+    cqrs.NewEventHandler("SendWelcomeEmail", func(ctx context.Context, event *UserRegistered) error {
+        return emailService.Send(event.Email, "Welcome!")
+    }),
+)
+```
+
+## Building blocks
+
+<AccordionGroup>
+
+<Accordion title="EventBus and EventBusConfig">
+
+`EventBus` transports events to event handlers. Create one with `NewEventBusWithConfig`:
+
+```go
+eventBus, err := cqrs.NewEventBusWithConfig(publisher, cqrs.EventBusConfig{
+    GeneratePublishTopic: func(params cqrs.GenerateEventPublishTopicParams) (string, error) {
+        return "events." + params.EventName, nil
+    },
+    OnPublish: func(params cqrs.OnEventSendParams) error {
+        // called before sending; params.Message can be modified
+        params.Message.Metadata.Set("published_at", time.Now().String())
+        return nil
+    },
+    Marshaler: cqrsMarshaler,
+    Logger:    logger,
+})
+```
+
+**`EventBusConfig` fields:**
+
+| Field | Required | Description |
+|---|---|---|
+| `GeneratePublishTopic` | Yes | Returns the topic name for a given event. Receives `GenerateEventPublishTopicParams` with `EventName` and `Event`. |
+| `Marshaler` | Yes | Marshals and unmarshals events to/from `message.Message`. |
+| `OnPublish` | No | Hook called before publishing. The `*message.Message` can be modified. |
+| `Logger` | No | Defaults to `watermill.NopLogger{}` if nil. |
+
+Publish an event with:
+
+```go
+err := eventBus.Publish(ctx, &MyEvent{Field: "value"})
+```
+
+</Accordion>
+
+<Accordion title="EventProcessor and EventProcessorConfig">
+
+`EventProcessor` determines which `EventHandler` handles each event. Each handler gets its own subscriber instance. Create one with `NewEventProcessorWithConfig`:
+
+```go
+eventProcessor, err := cqrs.NewEventProcessorWithConfig(
+    router,
+    cqrs.EventProcessorConfig{
+        GenerateSubscribeTopic: func(params cqrs.EventProcessorGenerateSubscribeTopicParams) (string, error) {
+            return "events." + params.EventName, nil
+        },
+        SubscriberConstructor: func(params cqrs.EventProcessorSubscriberConstructorParams) (message.Subscriber, error) {
+            // create a new subscriber per handler
+            return amqp.NewSubscriber(amqpConfig, logger)
+        },
+        OnHandle: func(params cqrs.EventProcessorOnHandleParams) error {
+            start := time.Now()
+            err := params.Handler.Handle(params.Message.Context(), params.Event)
+            logger.Info("Event handled", watermill.LogFields{
+                "event_name": params.EventName,
+                "duration":   time.Since(start),
+            })
+            return err
+        },
+        AckOnUnknownEvent: false,
+        Marshaler:         cqrsMarshaler,
+        Logger:            logger,
+    },
+)
+```
+
+**`EventProcessorConfig` fields:**
+
+| Field | Required | Description |
+|---|---|---|
+| `GenerateSubscribeTopic` | Yes | Returns the topic to subscribe to for a given event/handler. |
+| `SubscriberConstructor` | Yes | Called once per handler to create its subscriber. |
+| `Marshaler` | Yes | Marshals and unmarshals events. |
+| `OnHandle` | No | Middleware-like hook around each handle call. Must call `params.Handler.Handle()` explicitly. |
+| `AckOnUnknownEvent` | No | When `true`, messages for unknown event types are acked silently instead of returning an error. |
+| `Logger` | No | Defaults to `watermill.NopLogger{}` if nil. |
+
+Add handlers after creating the processor:
+
+```go
+err = eventProcessor.AddHandlers(
+    cqrs.NewEventHandler("MyHandler", myHandlerFunc),
+)
+```
+
+</Accordion>
+
+<Accordion title="EventGroupProcessor and EventGroupProcessorConfig">
+
+`EventGroupProcessor` lets multiple handlers share a single subscriber instance and consumer group. This is useful when multiple event types arrive on the same topic and you need to preserve ordering.
+
+```go
+groupProcessor, err := cqrs.NewEventGroupProcessorWithConfig(
+    router,
+    cqrs.EventGroupProcessorConfig{
+        GenerateSubscribeTopic: func(params cqrs.EventGroupProcessorGenerateSubscribeTopicParams) (string, error) {
+            return "events." + params.EventGroupName, nil
+        },
+        SubscriberConstructor: func(params cqrs.EventGroupProcessorSubscriberConstructorParams) (message.Subscriber, error) {
+            // one subscriber per group, shared by all handlers in the group
+            return amqp.NewSubscriber(amqpConfig, logger)
+        },
+        AckOnUnknownEvent: true,
+        Marshaler:         cqrsMarshaler,
+        Logger:            logger,
+    },
+)
+```
+
+Then add a group of handlers:
+
+```go
+err = groupProcessor.AddHandlersGroup(
+    "my-group",
+    cqrs.NewGroupEventHandler(func(ctx context.Context, event *RoomBooked) error {
+        // handle RoomBooked
+        return nil
+    }),
+    cqrs.NewGroupEventHandler(func(ctx context.Context, event *BeerOrdered) error {
+        // handle BeerOrdered
+        return nil
+    }),
+)
+```
+
+**Key differences vs `EventProcessor`:**
+
+| | `EventProcessor` | `EventGroupProcessor` |
+|---|---|---|
+| Subscriber instances | One per handler | One per group |
+| Event types per group | One | Multiple |
+| Ordering guarantee | Per-handler | Per-group (one consumer group) |
+
+<Note>
+Multiple handlers for the same event type in one group are allowed but not recommended. If the first handler succeeds and the second fails, the message is redelivered and the first handler will re-execute.
+</Note>
+
+</Accordion>
+
+<Accordion title="EventHandler">
+
+`EventHandler` is the interface for receiving events:
+
+```go
+type EventHandler interface {
+    HandlerName() string
+    NewEvent() any
+    Handle(ctx context.Context, event any) error
+}
+```
+
+Use the generic constructor instead of implementing the interface manually:
+
+```go
+// NewEventHandler creates a typed handler from a function.
+func NewEventHandler[T any](
+    handlerName string,
+    handleFunc func(ctx context.Context, event *T) error,
+) EventHandler
+```
+
+For group processors, use `NewGroupEventHandler` (no name required):
+
+```go
+func NewGroupEventHandler[T any](handleFunc func(ctx context.Context, event *T) error) GroupEventHandler
+```
+
+<Warning>
+Changing `HandlerName` when it is used to generate consumer group names will cause messages to be reprocessed from the beginning.
+</Warning>
+
+</Accordion>
+
+<Accordion title="CommandBus and CommandBusConfig">
+
+`CommandBus` transports commands to their single handler. Create one with `NewCommandBusWithConfig`:
+
+```go
+commandBus, err := cqrs.NewCommandBusWithConfig(publisher, cqrs.CommandBusConfig{
+    GeneratePublishTopic: func(params cqrs.CommandBusGeneratePublishTopicParams) (string, error) {
+        return "commands." + params.CommandName, nil
+    },
+    OnSend: func(params cqrs.CommandBusOnSendParams) error {
+        params.Message.Metadata.Set("sent_at", time.Now().String())
+        return nil
+    },
+    Marshaler: cqrsMarshaler,
+    Logger:    logger,
+})
+```
+
+**`CommandBusConfig` fields:**
+
+| Field | Required | Description |
+|---|---|---|
+| `GeneratePublishTopic` | Yes | Returns the topic for a given command. Receives `CommandBusGeneratePublishTopicParams` with `CommandName` and `Command`. |
+| `Marshaler` | Yes | Marshals and unmarshals commands. |
+| `OnSend` | No | Hook called before sending. The `*message.Message` can be modified. |
+| `Logger` | No | Defaults to `watermill.NopLogger{}` if nil. |
+
+Send a command with:
+
+```go
+err := commandBus.Send(ctx, &BookRoom{RoomID: "101", GuestName: "Alice"})
+```
+
+</Accordion>
+
+<Accordion title="CommandProcessor and CommandProcessorConfig">
+
+`CommandProcessor` routes incoming commands to the correct `CommandHandler`. Each command type must have exactly one handler.
+
+```go
+commandProcessor, err := cqrs.NewCommandProcessorWithConfig(
+    router,
+    cqrs.CommandProcessorConfig{
+        GenerateSubscribeTopic: func(params cqrs.CommandProcessorGenerateSubscribeTopicParams) (string, error) {
+            return "commands." + params.CommandName, nil
+        },
+        SubscriberConstructor: func(params cqrs.CommandProcessorSubscriberConstructorParams) (message.Subscriber, error) {
+            return commandsSubscriber, nil
+        },
+        OnHandle: func(params cqrs.CommandProcessorOnHandleParams) error {
+            start := time.Now()
+            err := params.Handler.Handle(params.Message.Context(), params.Command)
+            logger.Info("Command handled", watermill.LogFields{
+                "command_name": params.CommandName,
+                "duration":     time.Since(start),
+            })
+            return err
+        },
+        Marshaler: cqrsMarshaler,
+        Logger:    logger,
+    },
+)
+```
+
+**`CommandProcessorConfig` fields:**
+
+| Field | Required | Description |
+|---|---|---|
+| `GenerateSubscribeTopic` | Yes | Returns the topic to subscribe to for a given command/handler. |
+| `SubscriberConstructor` | Yes | Called once per handler to create its subscriber. |
+| `Marshaler` | Yes | Marshals and unmarshals commands. |
+| `OnHandle` | No | Middleware-like hook. Must call `params.Handler.Handle()` explicitly. |
+| `AckCommandHandlingErrors` | No | When `true`, messages are acked even if the handler returns an error. |
+| `Logger` | No | Defaults to `watermill.NopLogger{}` if nil. |
+
+</Accordion>
+
+<Accordion title="CommandHandler">
+
+`CommandHandler` is the interface for receiving commands. Every command type must have exactly one handler.
+
+```go
+type CommandHandler interface {
+    HandlerName() string
+    NewCommand() any
+    Handle(ctx context.Context, cmd any) error
+}
+```
+
+Use the generic constructor:
+
+```go
+// NewCommandHandler creates a typed handler from a function.
+func NewCommandHandler[Command any](
+    handlerName string,
+    handleFunc func(ctx context.Context, cmd *Command) error,
+) CommandHandler
+```
+
+Example:
+
+```go
+cqrs.NewCommandHandler("BookRoomHandler", func(ctx context.Context, cmd *BookRoom) error {
+    // process the command
+    return eventBus.Publish(ctx, &RoomBooked{RoomID: cmd.RoomID})
+})
+```
+
+</Accordion>
+
+<Accordion title="Marshalers">
+
+The `CommandEventMarshaler` interface controls how commands and events are serialized to `message.Message` payloads:
+
+```go
+type CommandEventMarshaler interface {
+    Marshal(v interface{}) (*message.Message, error)
+    Unmarshal(msg *message.Message, v interface{}) (err error)
+    Name(v interface{}) string
+    NameFromMessage(msg *message.Message) string
+}
+```
+
+Two built-in implementations are provided:
+
+- **`cqrs.JSONMarshaler`** — serializes to JSON. Suitable for most use cases.
+- **`cqrs.ProtoMarshaler`** — serializes using Protocol Buffers. Requires protobuf-generated types.
+
+Both accept a `GenerateName` field to control how event/command names are derived (e.g., `cqrs.StructName` uses the Go struct name).
+
+```go
+marshaler := cqrs.JSONMarshaler{
+    GenerateName: cqrs.StructName,
+}
+```
+
+**Marshaler decorator** — add extra metadata after marshaling (useful for Kafka partition keys, for example):
+
+```go
+decorated := cqrs.CommandEventMarshalerDecorator{
+    CommandEventMarshaler: cqrs.JSONMarshaler{GenerateName: cqrs.StructName},
+    DecorateFunc: func(v any, msg *message.Message) error {
+        if e, ok := v.(interface{ PartitionKey() string }); ok {
+            msg.Metadata.Set("partition_key", e.PartitionKey())
+        }
+        return nil
+    },
+}
+```
+
+</Accordion>
+
+</AccordionGroup>
+
+## Full setup example
+
+The following is a complete wiring example using RabbitMQ (AMQP) and Protobuf marshaling, taken from the [cqrs-protobuf example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/basic/5-cqrs-protobuf).
+
+<Steps>
+
+<Step title="Create the router">
+
+```go
+router, err := message.NewRouter(message.RouterConfig{}, logger)
+if err != nil {
+    panic(err)
+}
+router.AddMiddleware(middleware.Recoverer)
+```
+
+</Step>
+
+<Step title="Create the marshaler and topic functions">
+
+```go
+cqrsMarshaler := cqrs.ProtoMarshaler{GenerateName: cqrs.StructName}
+
+generateEventsTopic := func(eventName string) string {
+    return "events." + eventName
+}
+generateCommandsTopic := func(commandName string) string {
+    return "commands." + commandName
+}
+```
+
+</Step>
+
+<Step title="Create CommandBus and EventBus">
+
+```go
+commandBus, err := cqrs.NewCommandBusWithConfig(commandsPublisher, cqrs.CommandBusConfig{
+    GeneratePublishTopic: func(params cqrs.CommandBusGeneratePublishTopicParams) (string, error) {
+        return generateCommandsTopic(params.CommandName), nil
+    },
+    OnSend: func(params cqrs.CommandBusOnSendParams) error {
+        params.Message.Metadata.Set("sent_at", time.Now().String())
+        return nil
+    },
+    Marshaler: cqrsMarshaler,
+    Logger:    logger,
+})
+
+eventBus, err := cqrs.NewEventBusWithConfig(eventsPublisher, cqrs.EventBusConfig{
+    GeneratePublishTopic: func(params cqrs.GenerateEventPublishTopicParams) (string, error) {
+        return generateEventsTopic(params.EventName), nil
+    },
+    OnPublish: func(params cqrs.OnEventSendParams) error {
+        params.Message.Metadata.Set("published_at", time.Now().String())
+        return nil
+    },
+    Marshaler: cqrsMarshaler,
+    Logger:    logger,
+})
+```
+
+</Step>
+
+<Step title="Create CommandProcessor and EventProcessor">
+
+```go
+commandProcessor, err := cqrs.NewCommandProcessorWithConfig(
+    router,
+    cqrs.CommandProcessorConfig{
+        GenerateSubscribeTopic: func(params cqrs.CommandProcessorGenerateSubscribeTopicParams) (string, error) {
+            return generateCommandsTopic(params.CommandName), nil
+        },
+        SubscriberConstructor: func(params cqrs.CommandProcessorSubscriberConstructorParams) (message.Subscriber, error) {
+            return commandsSubscriber, nil
+        },
+        Marshaler: cqrsMarshaler,
+        Logger:    logger,
+    },
+)
+
+eventProcessor, err := cqrs.NewEventProcessorWithConfig(
+    router,
+    cqrs.EventProcessorConfig{
+        GenerateSubscribeTopic: func(params cqrs.EventProcessorGenerateSubscribeTopicParams) (string, error) {
+            return generateEventsTopic(params.EventName), nil
+        },
+        SubscriberConstructor: func(params cqrs.EventProcessorSubscriberConstructorParams) (message.Subscriber, error) {
+            config := amqp.NewDurablePubSubConfig(
+                amqpAddress,
+                amqp.GenerateQueueNameTopicNameWithSuffix(params.HandlerName),
+            )
+            return amqp.NewSubscriber(config, logger)
+        },
+        Marshaler: cqrsMarshaler,
+        Logger:    logger,
+    },
+)
+```
+
+</Step>
+
+<Step title="Register handlers and run the router">
+
+```go
+err = commandProcessor.AddHandlers(
+    cqrs.NewCommandHandler("BookRoomHandler", BookRoomHandler{eventBus}.Handle),
+    cqrs.NewCommandHandler("OrderBeerHandler", OrderBeerHandler{eventBus}.Handle),
+)
+
+err = eventProcessor.AddHandlers(
+    cqrs.NewEventHandler("OrderBeerOnRoomBooked", OrderBeerOnRoomBooked{commandBus}.Handle),
+    cqrs.NewEventHandler("BookingsFinancialReport", NewBookingsFinancialReport().Handle),
+)
+
+if err := router.Run(context.Background()); err != nil {
+    panic(err)
+}
+```
+
+</Step>
+
+</Steps>
+
+<Tip>
+The full working example including protobuf type definitions is available at [github.com/ThreeDotsLabs/watermill/tree/master/_examples/basic/5-cqrs-protobuf](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/basic/5-cqrs-protobuf).
+</Tip>

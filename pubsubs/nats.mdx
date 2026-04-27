@@ -1,0 +1,233 @@
+---
+title: "NATS JetStream Pub/Sub for Watermill"
+description: "Connect Watermill to NATS JetStream for persistent, high-performance messaging with consumer group support and optional exactly-once delivery."
+---
+
+NATS JetStream is the persistent streaming layer built on top of the NATS messaging system. It adds durable consumers, replay, and acknowledgement semantics on top of NATS' low-latency core, making it a strong choice for event-driven applications that need persistence without the operational overhead of Kafka.
+
+<Note>
+This backend lives in a separate module: [`github.com/ThreeDotsLabs/watermill-nats`](https://github.com/ThreeDotsLabs/watermill-nats). You need to install it in addition to the core `watermill` package.
+</Note>
+
+## Installation
+
+```bash
+go get github.com/ThreeDotsLabs/watermill-nats/v2
+```
+
+## Characteristics
+
+| Feature               | Supported | Notes                                                                                                         |
+|-----------------------|-----------|---------------------------------------------------------------------------------------------------------------|
+| ConsumerGroups        | yes       | Set `QueueGroupPrefix` or provide a custom `DurableCalculator`                                                |
+| ExactlyOnceDelivery   | yes       | Requires `AckAsync: false` (default) and `TrackMsgId: true` in JetStream config                               |
+| GuaranteedOrder       | no        | With redelivery enabled, ordering cannot be guaranteed                                                        |
+| Persistent            | yes       |                                                                                                               |
+
+## Configuration
+
+### Shared JetStream config
+
+Both the publisher and subscriber share a `JetStreamConfig` for stream-level settings:
+
+```go
+type JetStreamConfig struct {
+    // Disabled disables JetStream support and falls back to core NATS.
+    Disabled bool
+
+    // AutoProvision creates streams automatically if they don't exist.
+    AutoProvision bool
+
+    // ConnectOptions are extra NATS connection options.
+    ConnectOptions []nats.Option
+
+    // SubscribeOptions are JetStream subscribe options applied to every subscription.
+    SubscribeOptions []nats.SubOpt
+
+    // TrackMsgId enables exactly-once delivery using NATS message deduplication.
+    TrackMsgId bool
+
+    // AckAsync enables async acks; set to false for exactly-once delivery.
+    AckAsync bool
+
+    // PublishOptions are JetStream publish options applied to every publish call.
+    PublishOptions []nats.PubOpt
+
+    // DurablePrefix is prepended to auto-generated durable consumer names.
+    DurablePrefix string
+
+    // QueueGroupPrefix is the prefix for queue group consumer groups.
+    QueueGroupPrefix string
+}
+```
+
+### Publisher config
+
+```go
+type PublisherConfig struct {
+    // URL is the NATS server URL. Defaults to nats://localhost:4222.
+    URL string
+
+    // JetStream holds JetStream-specific options.
+    JetStream JetStreamConfig
+
+    // Marshaler serializes Watermill messages into NATS messages.
+    Marshaler Marshaler
+}
+```
+
+### Subscriber config
+
+```go
+type SubscriberConfig struct {
+    // URL is the NATS server URL. Defaults to nats://localhost:4222.
+    URL string
+
+    // QueueGroupPrefix scopes consumers into a named group (consumer groups).
+    QueueGroupPrefix string
+
+    // DurableCalculator generates a durable name for each topic + queue group combination.
+    DurableCalculator DurableCalculator
+
+    // JetStream holds JetStream-specific options.
+    JetStream JetStreamConfig
+
+    // Unmarshaler deserializes NATS messages into Watermill messages.
+    Unmarshaler Unmarshaler
+
+    // SubscribeTimeout is the timeout for subscribe calls.
+    SubscribeTimeout time.Duration
+
+    // CloseTimeout is the timeout for closing the subscriber.
+    CloseTimeout time.Duration
+
+    // AckWaitTimeout is how long NATS waits before redelivering an unacked message.
+    AckWaitTimeout time.Duration
+}
+```
+
+## Publisher setup
+
+```go
+import (
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-nats/v2/pkg/nats"
+)
+
+publisher, err := nats.NewPublisher(
+    nats.PublisherConfig{
+        URL: "nats://localhost:4222",
+        JetStream: nats.JetStreamConfig{
+            AutoProvision: true,
+        },
+        Marshaler: &nats.NATSMarshaler{},
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+```
+
+## Subscriber setup
+
+```go
+subscriber, err := nats.NewSubscriber(
+    nats.SubscriberConfig{
+        URL:              "nats://localhost:4222",
+        QueueGroupPrefix: "my-service",
+        JetStream: nats.JetStreamConfig{
+            AutoProvision: true,
+        },
+        Unmarshaler: &nats.NATSMarshaler{},
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer subscriber.Close()
+```
+
+<Tip>
+You can also use `NewPublisherWithNatsConn` and `NewSubscriberWithNatsConn` when you need to share an existing `*nats.Conn`, for example when the same connection is used for other NATS work.
+</Tip>
+
+## Usage example
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-nats/v2/pkg/nats"
+    "github.com/ThreeDotsLabs/watermill/message"
+)
+
+func main() {
+    logger := watermill.NewStdLogger(false, false)
+
+    publisher, err := nats.NewPublisher(
+        nats.PublisherConfig{
+            URL:       "nats://localhost:4222",
+            JetStream: nats.JetStreamConfig{AutoProvision: true},
+            Marshaler: &nats.NATSMarshaler{},
+        },
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer publisher.Close()
+
+    subscriber, err := nats.NewSubscriber(
+        nats.SubscriberConfig{
+            URL:              "nats://localhost:4222",
+            QueueGroupPrefix: "svc-a",
+            JetStream:        nats.JetStreamConfig{AutoProvision: true},
+            Unmarshaler:      &nats.NATSMarshaler{},
+        },
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer subscriber.Close()
+
+    msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"item_shipped"}`))
+    if err := publisher.Publish("shipments", msg); err != nil {
+        panic(err)
+    }
+
+    messages, err := subscriber.Subscribe(context.Background(), "shipments")
+    if err != nil {
+        panic(err)
+    }
+
+    for msg := range messages {
+        fmt.Printf("Received: %s\n", msg.Payload)
+        msg.Ack()
+    }
+}
+```
+
+## Marshaler
+
+The default NATS marshaler passes the message payload as the NATS message body and propagates Watermill metadata through NATS headers. The reserved header `_watermill_message_uuid` carries the message UUID.
+
+Alternative marshalers using `encoding/gob` or `encoding/json` are also available, and a [Protobuf example](https://github.com/ThreeDotsLabs/watermill-nats/tree/master/_examples/marshalers/protobuf/) shows how to implement a custom one.
+
+## Core NATS
+
+The package includes limited support for [core NATS](https://docs.nats.io/nats-concepts/core-nats) without JetStream. Set `JetStreamConfig.Disabled = true` to use it. Core NATS does not persist messages, so most acks become no-ops. This mode is useful in mixed environments where some topics run over JetStream and others over core NATS.
+
+## Key considerations
+
+- **Consumer groups** — set `QueueGroupPrefix` to share a subscription across multiple instances. Instances with different prefixes each receive every message.
+- **Exactly-once** — requires `TrackMsgId: true` and `AckAsync: false`. NATS deduplicates within the configured deduplication window.
+- **Ordering** — not guaranteed due to redelivery. If order matters, use Kafka with partition keys.
+- **Examples** — see the [Watermill NATS JetStream example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/pubsubs/nats-jetstream) for a runnable demo.

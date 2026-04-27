@@ -1,0 +1,161 @@
+---
+title: "Message: the core unit in Watermill"
+description: "Every event in Watermill is a Message. Learn the struct layout, when to call Ack or Nack, how to listen for outcomes, and how context is propagated."
+---
+
+A `Message` is the fundamental unit of data transfer in Watermill. Publishers produce messages and subscribers consume them. Every message carries a unique identifier, a binary payload, key-value metadata, and signaling channels that tell the infrastructure whether the message was processed successfully.
+
+## The Message struct
+
+```go
+// Message is the basic transfer unit.
+// Messages are emitted by Publishers and received by Subscribers.
+type Message struct {
+    // UUID is a unique identifier of the message.
+    // It is only used by Watermill for debugging. UUID can be empty.
+    UUID string
+
+    // Metadata contains the message metadata.
+    // Can be used to store data which doesn't require unmarshalling the entire payload.
+    // It is something similar to HTTP request's headers.
+    // Metadata is marshaled and will be saved to the PubSub.
+    Metadata Metadata
+
+    // Payload is the message's payload.
+    Payload Payload
+    // ack and noAck channels are unexported; use Ack()/Nack() and Acked()/Nacked()
+}
+```
+
+`Payload` is `[]byte`, so you can store raw bytes, JSON, Protobuf, Avro, or any other encoding. `Metadata` is `map[string]string` — marshaled alongside the message and available without deserializing the payload.
+
+## Creating a message
+
+```go
+import (
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill/message"
+)
+
+// NewMessage creates a new Message with the given UUID and payload.
+msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"order_placed"}`))
+
+// Set metadata key-value pairs
+msg.Metadata.Set("tenant_id", "acme")
+msg.Metadata.Set("source", "checkout-service")
+```
+
+Use `watermill.NewUUID()` to generate a random UUID, or supply your own string. Passing an empty string is valid when the UUID is not needed.
+
+## Ack and Nack
+
+After a subscriber delivers a message to your handler, the infrastructure waits for one of two signals before it decides what to do next.
+
+| Method | Meaning | Behaviour |
+|--------|---------|-----------|
+| `msg.Ack()` | Processing succeeded | The message is removed from the queue / offset is committed |
+| `msg.Nack()` | Processing failed | The message is redelivered (at-least-once semantics) |
+
+Both methods are **non-blocking** and **idempotent**. Calling `Ack()` when a `Nack()` has already been sent returns `false` without doing anything, and vice versa.
+
+```go
+// Ack sends message's acknowledgement.
+// Ack is not blocking.
+// Ack is idempotent.
+// False is returned if Nack was already sent.
+func (m *Message) Ack() bool
+
+// Nack sends message's negative acknowledgement.
+// Nack is not blocking.
+// Nack is idempotent.
+// False is returned if Ack was already sent.
+func (m *Message) Nack() bool
+```
+
+<Note>
+When using the Router, you do **not** need to call `Ack()` or `Nack()` manually. The Router calls `Ack()` automatically when your handler returns `nil`, and `Nack()` when it returns an error.
+</Note>
+
+### Receiving Ack/Nack signals
+
+You can wait for the outcome of a message after handing it off. This is useful in publishers that need to confirm delivery or in tests.
+
+```go
+select {
+case <-msg.Acked():
+    // ack received — message was processed
+case <-msg.Nacked():
+    // nack received — message was rejected
+}
+```
+
+Both `Acked()` and `Nacked()` return `<-chan struct{}` channels that are closed when the corresponding signal is sent. A closed channel unblocks all receivers immediately.
+
+```go
+// Acked returns the channel which is closed when acknowledgement is sent.
+func (m *Message) Acked() <-chan struct{}
+
+// Nacked returns the channel which is closed when negative acknowledgement is sent.
+func (m *Message) Nacked() <-chan struct{}
+```
+
+## Context
+
+Every `Message` carries a `context.Context`, analogous to an HTTP request's context. It is used to propagate cancellation signals and deadlines through the processing pipeline.
+
+```go
+// Context returns the message's context. Defaults to context.Background() if not set.
+func (m *Message) Context() context.Context
+
+// SetContext sets the provided context on the message.
+func (m *Message) SetContext(ctx context.Context)
+```
+
+You can attach a context at construction time with `NewMessageWithContext`:
+
+```go
+// NewMessageWithContext creates a new Message with the given UUID, payload, and context.
+func NewMessageWithContext(ctx context.Context, uuid string, payload Payload) *Message {
+    msg := NewMessage(uuid, payload)
+    msg.SetContext(ctx)
+    return msg
+}
+```
+
+When a message travels through the Router, the Router enriches its context with values such as the handler name, subscriber name, and topic. You can retrieve these with helper functions like `message.HandlerNameFromCtx(msg.Context())`.
+
+## Copying a message
+
+Because a `Message` should be treated as immutable once published, use `Copy()` to create a new message with the same UUID, payload, and metadata but with fresh Ack/Nack channels.
+
+```go
+// Copy copies all message fields without Acks/Nacks.
+// The context is not propagated to the copy.
+func (m *Message) Copy() *Message
+
+// CopyWithContext copies all message fields without Acks/Nacks.
+// The context is also propagated to the copy.
+func (m *Message) CopyWithContext() *Message
+```
+
+<Warning>
+Do not modify a message concurrently while it is being published. If you need to alter a message after creation, call `Copy()` first and modify the copy.
+</Warning>
+
+## Metadata
+
+`Metadata` is a `map[string]string` with two convenience methods:
+
+```go
+// Metadata is sent with every message to provide extra context
+// without unmarshaling the message payload.
+type Metadata map[string]string
+
+// Get returns the value for the given key, or "" if not found.
+func (m Metadata) Get(key string) string
+
+// Set sets the metadata key to value.
+func (m Metadata) Set(key, value string)
+```
+
+Metadata is serialized alongside the payload and stored in the pub/sub backend. Use it for routing hints, tracing IDs, tenant identifiers, and similar lightweight annotations that do not belong in the payload.

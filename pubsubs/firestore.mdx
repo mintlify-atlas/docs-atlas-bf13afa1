@@ -1,0 +1,219 @@
+---
+title: "Firestore Pub/Sub for Watermill"
+description: "Use Google Cloud Firestore as a Watermill Pub/Sub backend. Publish messages transactionally alongside Firestore document writes in a single atomic operation."
+---
+
+Cloud Firestore is a cloud-hosted, NoSQL document database from Google. The Watermill Firestore adapter stores messages as Firestore documents, which enables transactional publishing — you can persist messages and other application data in a single Firestore transaction, guaranteeing they are either both saved or neither is.
+
+This makes Firestore Pub/Sub a practical choice for implementing the [Outbox pattern](https://watermill.io/docs/forwarder/) when your application is already using Firestore as its primary data store.
+
+<Note>
+This backend lives in a separate module: [`github.com/ThreeDotsLabs/watermill-firestore`](https://github.com/ThreeDotsLabs/watermill-firestore). You need to install it in addition to the core `watermill` package.
+</Note>
+
+## Installation
+
+```bash
+go get github.com/ThreeDotsLabs/watermill-firestore
+```
+
+## Characteristics
+
+| Feature               | Supported | Notes |
+|-----------------------|-----------|-------|
+| ConsumerGroups        | yes       |       |
+| ExactlyOnceDelivery   | no        |       |
+| GuaranteedOrder       | no        |       |
+| Persistent            | yes       |       |
+
+## Configuration
+
+### Publisher config
+
+```go
+type PublisherConfig struct {
+    // ProjectID is your Google Cloud project ID.
+    ProjectID string
+
+    // CustomFirestoreClient allows injecting a pre-configured Firestore client.
+    // When nil, a client is created using ProjectID and the default credentials.
+    CustomFirestoreClient *firestore.Client
+
+    // Marshaler serializes Watermill messages for storage in Firestore.
+    Marshaler Marshaler
+
+    // PubSubRootCollection is the name of the root Firestore collection used
+    // for storing messages. Defaults to "pubsub".
+    PubSubRootCollection string
+}
+```
+
+### Subscriber config
+
+```go
+type SubscriberConfig struct {
+    // ProjectID is your Google Cloud project ID.
+    ProjectID string
+
+    // CustomFirestoreClient allows injecting a pre-configured Firestore client.
+    CustomFirestoreClient *firestore.Client
+
+    // Unmarshaler deserializes Firestore documents into Watermill messages.
+    Unmarshaler Unmarshaler
+
+    // GenerateSubscriptionName returns the subscription name for a topic.
+    // Defaults to <topic>_sub.
+    GenerateSubscriptionName GenerateSubscriptionNameFn
+
+    // PubSubRootCollection is the name of the root Firestore collection.
+    PubSubRootCollection string
+}
+```
+
+## Publisher setup
+
+The adapter provides two publisher types:
+
+- **`Publisher`** — a standard publisher for non-transactional use.
+- **`TransactionalPublisher`** — publishes messages inside a Firestore transaction.
+
+```go
+import (
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-firestore/pkg/firestore"
+)
+
+publisher, err := firestore.NewPublisher(
+    firestore.PublisherConfig{
+        ProjectID: "my-gcp-project",
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+```
+
+### Transactional publishing
+
+```go
+txPublisher, err := firestore.NewTransactionalPublisher(
+    firestore.PublisherConfig{
+        ProjectID: "my-gcp-project",
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer txPublisher.Close()
+
+// Inside a Firestore transaction:
+err = firestoreClient.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+    // Save your domain data
+    _, err := tx.Set(docRef, myData)
+    if err != nil {
+        return err
+    }
+    // Publish message atomically with the data save
+    msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"order_confirmed"}`))
+    return txPublisher.PublishInTransaction(ctx, tx, "orders", msg)
+})
+```
+
+## Subscriber setup
+
+```go
+subscriber, err := firestore.NewSubscriber(
+    firestore.SubscriberConfig{
+        ProjectID: "my-gcp-project",
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer subscriber.Close()
+```
+
+## Usage example
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/ThreeDotsLabs/watermill"
+    watermillfs "github.com/ThreeDotsLabs/watermill-firestore/pkg/firestore"
+    "github.com/ThreeDotsLabs/watermill/message"
+)
+
+func main() {
+    logger := watermill.NewStdLogger(false, false)
+
+    publisher, err := watermillfs.NewPublisher(
+        watermillfs.PublisherConfig{ProjectID: "my-gcp-project"},
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer publisher.Close()
+
+    subscriber, err := watermillfs.NewSubscriber(
+        watermillfs.SubscriberConfig{ProjectID: "my-gcp-project"},
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer subscriber.Close()
+
+    msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"document_updated"}`))
+    if err := publisher.Publish("documents", msg); err != nil {
+        panic(err)
+    }
+
+    messages, err := subscriber.Subscribe(context.Background(), "documents")
+    if err != nil {
+        panic(err)
+    }
+
+    for msg := range messages {
+        fmt.Printf("Received: %s\n", msg.Payload)
+        msg.Ack()
+    }
+}
+```
+
+## Subscription naming
+
+In Watermill, subscriptions are created automatically when `Subscribe()` is called. The subscription name is generated by `SubscriberConfig.GenerateSubscriptionName`. The default appends `_sub` to the topic name.
+
+To have multiple independent consumers — each receiving every message — provide a unique subscription name generator per consumer:
+
+```go
+firestore.SubscriberConfig{
+    ProjectID: "my-gcp-project",
+    GenerateSubscriptionName: func(topic string) string {
+        return topic + "_" + myServiceName
+    },
+}
+```
+
+Only messages published after a subscription is created are delivered to that subscription.
+
+## Marshaler
+
+Watermill messages cannot be stored directly in Firestore. The marshaler converts them into a map that Firestore can persist. The default implementation handles all standard use cases; implement the `Marshaler` / `Unmarshaler` interfaces only if you need a custom storage format.
+
+See the [package documentation](https://pkg.go.dev/github.com/ThreeDotsLabs/watermill-firestore) for the full API reference.
+
+## Key considerations
+
+- **Transactional publishing** — the main reason to choose this backend. Use `TransactionalPublisher` when message emission and data persistence must be atomic.
+- **Not a dedicated broker** — Firestore has per-document write limits and is not designed for very high message throughput. For high-volume streams, publish to Firestore first and then relay messages to a faster broker using the [Forwarder](https://watermill.io/docs/forwarder/).
+- **At-least-once delivery** — messages may be delivered more than once. Design consumers to be idempotent.

@@ -1,0 +1,100 @@
+---
+title: "Pub/Sub backends supported by Watermill"
+description: "Browse all Watermill Pub/Sub backends including Kafka, RabbitMQ, NATS, Redis, SQL, GCP, AWS, and GoChannel, with throughput benchmarks to guide your choice."
+---
+
+Watermill decouples your application code from the underlying messaging infrastructure through a pair of simple interfaces — `Publisher` and `Subscriber`. Every backend listed here implements those same two interfaces, which means you can swap brokers with minimal code changes.
+
+```go
+type Publisher interface {
+    Publish(topic string, messages ...*Message) error
+    Close() error
+}
+
+type Subscriber interface {
+    Subscribe(ctx context.Context, topic string) (<-chan *Message, error)
+    Close() error
+}
+```
+
+One backend — **GoChannel** — ships inside the main `watermill` module. All others are maintained in separate modules under the `github.com/ThreeDotsLabs` organisation and require an additional `go get`.
+
+## Supported backends
+
+<CardGroup cols={3}>
+  <Card title="Kafka" icon="layer-group" href="/pubsubs/kafka">
+    Apache Kafka distributed streaming platform, backed by IBM Sarama.
+  </Card>
+  <Card title="RabbitMQ (AMQP)" icon="rabbit" href="/pubsubs/amqp">
+    The most widely deployed open source message broker.
+  </Card>
+  <Card title="NATS JetStream" icon="bolt" href="/pubsubs/nats">
+    Simple, secure and high-performance messaging with persistent streams.
+  </Card>
+  <Card title="Redis Stream" icon="database" href="/pubsubs/redis-stream">
+    Append-only log backed by Redis with consumer group support.
+  </Card>
+  <Card title="SQL (MySQL / PostgreSQL)" icon="table" href="/pubsubs/sql">
+    Use your existing SQL database as a reliable message queue.
+  </Card>
+  <Card title="Google Cloud Pub/Sub" icon="cloud" href="/pubsubs/google-cloud">
+    Fully-managed real-time messaging service from Google Cloud.
+  </Card>
+  <Card title="HTTP" icon="globe" href="/pubsubs/http">
+    Receive webhooks as messages and send messages as HTTP requests.
+  </Card>
+  <Card title="GoChannel" icon="code" href="/pubsubs/gochannel">
+    In-process pub/sub built on Go channels. No external dependencies.
+  </Card>
+  <Card title="AWS SNS / SQS" icon="aws" href="/pubsubs/aws">
+    Fully-managed queuing and pub/sub services from Amazon Web Services.
+  </Card>
+  <Card title="Firestore" icon="fire" href="/pubsubs/firestore">
+    Google Cloud Firestore used as a transactional pub/sub store.
+  </Card>
+  <Card title="Bolt" icon="hard-drive" href="/pubsubs/bolt">
+    Embedded key/value store — no external server required.
+  </Card>
+  <Card title="io.Reader / io.Writer" icon="terminal" href="/pubsubs/io">
+    Wrap any Go stdlib Reader or Writer as a Pub/Sub source or sink.
+  </Card>
+</CardGroup>
+
+## Benchmarks
+
+The numbers below come from [watermill-benchmark](https://github.com/ThreeDotsLabs/watermill-benchmark) and were collected on a single 16-CPU VM running one binary with dependencies in Docker Compose. Message size is 16 bytes. Results will vary significantly depending on your hardware and configuration.
+
+| Pub/Sub                           | Publish (msg/s) | Subscribe (msg/s) |
+|-----------------------------------|-----------------|-------------------|
+| GoChannel                         | 315,776         | 138,743           |
+| Redis Streams                     | 59,158          | 12,134            |
+| NATS JetStream (16 subscribers)   | 50,668          | 34,713            |
+| Kafka (one node)                  | 41,492          | 101,669           |
+| SQL (MySQL, batch size = 100)     | 6,371           | 2,794             |
+| SQL (PostgreSQL, batch size = 1)  | 2,831           | 9,460             |
+| Google Cloud Pub/Sub              | 3,027           | 28,589            |
+| AMQP (RabbitMQ)                   | 2,770           | 14,604            |
+
+<Note>
+GoChannel is the fastest option because there is no network round-trip — messages travel in-process over Go channels. It is not suitable for multi-process or distributed deployments.
+</Note>
+
+## Choosing a backend
+
+<AccordionGroup>
+  <Accordion title="I need the highest possible throughput">
+    GoChannel is the fastest option for in-process workloads. For distributed systems, Kafka and Redis Streams offer the best raw throughput.
+  </Accordion>
+  <Accordion title="I need messages to survive process restarts">
+    Use any backend marked **Persistent** in its characteristics table — Kafka, NATS JetStream, Redis Streams, SQL, Google Cloud Pub/Sub, AWS SQS/SNS, Firestore, or Bolt.
+  </Accordion>
+  <Accordion title="I need multiple independent consumers on the same topic">
+    Any backend with **ConsumerGroups** support allows multiple subscriber groups to each receive every message independently. GoChannel does not support consumer groups.
+  </Accordion>
+  <Accordion title="I only have a SQL database available">
+    The SQL backend works with MySQL and PostgreSQL. It is a good fit for the [Outbox pattern](https://watermill.io/docs/forwarder/) and projects that cannot introduce a dedicated broker.
+  </Accordion>
+  <Accordion title="I want no external dependencies at all">
+    GoChannel requires no external processes. Bolt also runs embedded without a server.
+  </Accordion>
+</AccordionGroup>

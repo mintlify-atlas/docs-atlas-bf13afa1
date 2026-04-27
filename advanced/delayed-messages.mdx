@@ -1,0 +1,157 @@
+---
+title: "Sending delayed messages with Watermill"
+description: "Schedule messages for future delivery using the delay package to set delay metadata, with support for raw messages and the CQRS component."
+---
+
+Delaying events or commands is a common requirement — for example, sending a feedback form a few days after a user places an order, or retrying a notification after a cooldown period. Watermill's `components/delay` package provides a lightweight API for attaching delay metadata to messages.
+
+<Warning>
+**Delay metadata alone does nothing.** You need a Pub/Sub implementation that reads and enforces the delay. Currently supported: **PostgreSQL** and **MySQL** via the [`watermill-sql`](https://github.com/ThreeDotsLabs/watermill-sql) package.
+</Warning>
+
+## Delay API
+
+The `delay` package exposes two constructors for creating a `Delay` value:
+
+```go
+// For returns a delay of now plus the given duration.
+func For(delayedFor time.Duration) Delay
+
+// Until returns a delay until a specific point in time.
+func Until(delayedUntil time.Time) Delay
+```
+
+### With raw messages
+
+Call `delay.Message` to set the delay metadata directly on a `*message.Message`:
+
+```go
+msg := message.NewMessage(watermill.NewUUID(), []byte("hello"))
+delay.Message(msg, delay.For(10*time.Second))
+```
+
+This sets two metadata keys on the message:
+
+| Key | Value |
+|---|---|
+| `_watermill_delayed_until` | RFC3339 timestamp of when delivery should occur |
+| `_watermill_delayed_for` | Duration string (e.g. `"10s"`) |
+
+### With the CQRS component
+
+When using the CQRS component you don't have direct access to the `*message.Message` before it's published. Use `delay.WithContext` to attach the delay to the context instead:
+
+```go
+ctx = delay.WithContext(ctx, delay.For(8*time.Second))
+err := commandBus.Send(ctx, cmd)
+```
+
+The delay is applied to the message when it is marshaled, provided the underlying publisher is wrapped with `delay.NewPublisher`.
+
+### Publisher wrapper
+
+`delay.NewPublisher` wraps any `message.Publisher` to automatically apply delays from the message context or from a default generator:
+
+```go
+func NewPublisher(pub message.Publisher, config PublisherConfig) (message.Publisher, error)
+```
+
+```go
+type PublisherConfig struct {
+    // DefaultDelayGenerator generates a delay for messages that don't have one set.
+    // Receives the topic and the message.
+    DefaultDelayGenerator func(params DefaultDelayGeneratorParams) (Delay, error)
+
+    // AllowNoDelay allows publishing messages without any delay.
+    // By default, an error is returned when no delay is set and no generator is provided.
+    AllowNoDelay bool
+}
+```
+
+When a message is published, the publisher checks (in order):
+
+1. Whether the message already has `_watermill_delayed_for` metadata set — if so, no change.
+2. Whether the context carries a delay set via `delay.WithContext` — applies it.
+3. Whether `DefaultDelayGenerator` is configured — calls it and applies the result.
+4. If none of the above applies and `AllowNoDelay` is false, returns an error.
+
+## Full example
+
+The following is a condensed version of the [delayed-messages example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/real-world-examples/delayed-messages). It uses a PostgreSQL-backed delayed publisher (via `watermill-sql`) and the Forwarder component to move delayed messages into Redis Streams once they are due.
+
+```go
+// Create a delayed PostgreSQL publisher (watermill-sql).
+var sqlPublisher message.Publisher
+sqlPublisher, err = sql.NewDelayedPostgreSQLPublisher(db, sql.DelayedPostgreSQLPublisherConfig{
+    DelayPublisherConfig: delay.PublisherConfig{},
+    Logger:               logger,
+})
+
+// Wrap with forwarder.Publisher so the Forwarder can route messages to Redis.
+sqlPublisher = forwarder.NewPublisher(sqlPublisher, forwarder.PublisherConfig{
+    ForwarderTopic: "forwarder",
+})
+
+// Build a command bus that publishes to PostgreSQL (via sqlPublisher).
+commandBus, err := cqrs.NewCommandBusWithConfig(sqlPublisher, cqrs.CommandBusConfig{
+    GeneratePublishTopic: func(params cqrs.CommandBusGeneratePublishTopicParams) (string, error) {
+        return params.CommandName, nil
+    },
+    Marshaler: marshaler,
+    Logger:    logger,
+})
+```
+
+In the event handler, attach a delay to the context before sending a command:
+
+```go
+err = eventProcessor.AddHandlers(
+    cqrs.NewEventHandler(
+        "OnOrderPlacedHandler",
+        func(ctx context.Context, event *OrderPlaced) error {
+            cmd := SendFeedbackForm{
+                To:   event.Customer.Email,
+                Name: event.Customer.Name,
+            }
+
+            // In a real world scenario, we would delay the command by a few days.
+            ctx = delay.WithContext(ctx, delay.For(8*time.Second))
+
+            return commandBus.Send(ctx, cmd)
+        },
+    ),
+)
+```
+
+The Forwarder picks up messages from PostgreSQL once they are past their delay and forwards them to Redis Streams:
+
+```go
+_, err = forwarder.NewForwarder(
+    sqlSubscriber,
+    redisPublisher,
+    logger,
+    forwarder.Config{
+        ForwarderTopic: "forwarder",
+        Router:         router,
+    },
+)
+```
+
+<Tip>
+Use `delay.Until(time.Time)` instead of `delay.For(time.Duration)` when you need to deliver a message at an absolute point in time rather than relative to now.
+</Tip>
+
+## Supported Pub/Subs
+
+Delay metadata is only enforced by Pub/Sub implementations that support it. As of the current release:
+
+<CardGroup cols={2}>
+  <Card title="PostgreSQL" href="https://watermill.io/pubsubs/sql/">
+    Use `sql.NewDelayedPostgreSQLPublisher` and `sql.NewDelayedPostgreSQLSubscriber` from `watermill-sql`.
+  </Card>
+  <Card title="MySQL" href="https://watermill.io/pubsubs/sql/">
+    The same `watermill-sql` package supports MySQL with an equivalent delayed publisher/subscriber.
+  </Card>
+</CardGroup>
+
+Other Pub/Sub implementations silently ignore the delay metadata.

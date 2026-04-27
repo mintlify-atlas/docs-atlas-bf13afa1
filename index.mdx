@@ -1,133 +1,83 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
-icon: 'star'
+title: "Watermill: Event-Driven Messaging for Go"
+description: "Watermill is a Go library for building event-driven applications in Go. One interface works across Kafka, RabbitMQ, NATS, Redis, SQL, and more."
 ---
 
-## Setting up
+Watermill makes it easy to build event-driven systems in Go. It gives you a single, consistent interface for publishing and consuming messages, regardless of which message broker or queue you're using underneath. Whether you're processing Kafka streams, routing RabbitMQ messages, or running a simple in-process pub/sub for tests, Watermill works the same way.
 
-Get your documentation site up and running in minutes.
-
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
-
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Get Started" icon="rocket" href="/getting-started">
+    Install Watermill and send your first message in minutes.
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Hands-on exercises to learn Watermill by building real event-driven apps.
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Core Concepts" icon="book" href="/concepts/message">
+    Understand Messages, Publishers, Subscribers, and the Router.
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Pub/Sub Backends" icon="server" href="/pubsubs/overview">
+    Browse all supported backends: Kafka, RabbitMQ, NATS, Redis, SQL, and more.
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Why Watermill?
 
-Everything you need to create world-class documentation.
+Building distributed systems means dealing with message brokers — and every broker has its own client library, API, and quirks. Watermill hides that complexity behind a clean interface so you can focus on your application logic.
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
+<CardGroup cols={2}>
+  <Card title="Unified Interface" icon="plug">
+    One `Publisher` and `Subscriber` interface works across all supported backends. Swap Kafka for RabbitMQ without rewriting handlers.
   </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
+  <Card title="Router & Middleware" icon="route">
+    The Router handles message routing, retries, circuit breakers, poison queues, throttling, and more — all composable as middleware.
   </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
+  <Card title="CQRS Built-In" icon="layer-group">
+    Work with Go structs instead of raw messages using the CQRS component's EventBus, EventProcessor, CommandBus, and CommandProcessor.
   </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
+  <Card title="Production Ready" icon="shield-check">
+    Every Pub/Sub implementation passes a rigorous shared test suite, including stress tests run 20x in parallel with race detection.
   </Card>
-</Columns>
+</CardGroup>
 
-## Make your content agent ready
+## How It Works
 
-Make your docs work for humans and AI agents alike.
+Watermill's architecture is built around three layers, each one building on the last:
 
-<Columns cols={2}>
-  <Card
-    title="Prompt component"
-    icon="robot"
-    href="/agent-ready/prompt"
-  >
-    Embed shareable AI prompts readers can copy or open in Cursor.
-  </Card>
-  <Card
-    title="Visibility"
-    icon="eye"
-    href="/agent-ready/visibility"
-  >
-    Show different content to humans and agents reading your docs.
-  </Card>
-  <Card
-    title="Contextual menu"
-    icon="bolt"
-    href="/agent-ready/contextual"
-  >
-    Give readers one-click access to Claude, ChatGPT, Cursor, and more.
-  </Card>
-  <Card
-    title="AI coding tools"
-    icon="wand-magic-sparkles"
-    href="/ai-tools/claude-code"
-  >
-    Set up Claude Code, Cursor, or Windsurf with Mintlify's skill.
-  </Card>
-</Columns>
+<Steps>
+  <Step title="Publisher & Subscriber">
+    The lowest-level API. Publish messages to a topic and subscribe to receive them. Works with any supported backend.
+  </Step>
+  <Step title="Router">
+    A higher-level construct that wires subscribers to handlers, manages goroutines, sends Acks/Nacks automatically, and lets you attach middleware for cross-cutting concerns.
+  </Step>
+  <Step title="CQRS Component">
+    The highest-level API. Work with typed Go structs as events and commands instead of raw byte payloads. Ideal for event sourcing and domain-driven design.
+  </Step>
+</Steps>
 
-## Need inspiration?
+## Supported Pub/Sub Backends
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<CardGroup cols={3}>
+  <Card title="Kafka" icon="database" href="/pubsubs/kafka">
+    High-throughput stream processing
+  </Card>
+  <Card title="RabbitMQ (AMQP)" icon="rabbit" href="/pubsubs/amqp">
+    Flexible routing with exchanges
+  </Card>
+  <Card title="NATS JetStream" icon="bolt" href="/pubsubs/nats">
+    Lightweight, cloud-native messaging
+  </Card>
+  <Card title="Redis Streams" icon="layer-group" href="/pubsubs/redis-stream">
+    Low-latency in-memory streams
+  </Card>
+  <Card title="SQL (MySQL/PostgreSQL)" icon="table" href="/pubsubs/sql">
+    Transactional message queues
+  </Card>
+  <Card title="Google Cloud Pub/Sub" icon="cloud" href="/pubsubs/google-cloud">
+    Fully managed GCP messaging
+  </Card>
+</CardGroup>
+
+<Note>
+  Looking for AWS SNS/SQS, Firestore, HTTP, GoChannel, Bolt, or io.Reader/io.Writer? See the full [Pub/Sub Backends](/pubsubs/overview) list.
+</Note>

@@ -1,0 +1,201 @@
+---
+title: "Google Cloud Pub/Sub for Watermill"
+description: "Connect Watermill to Google Cloud Pub/Sub for a fully-managed, scalable messaging service with automatic topic and subscription provisioning."
+---
+
+Google Cloud Pub/Sub is a fully-managed, real-time messaging service that decouples senders from receivers. It provides low-latency, durable message delivery and serves as a foundation for stream analytics pipelines on Google Cloud Platform. The Watermill adapter handles topic and subscription creation automatically.
+
+<Note>
+This backend lives in a separate module: [`github.com/ThreeDotsLabs/watermill-googlecloud`](https://github.com/ThreeDotsLabs/watermill-googlecloud). You need to install it in addition to the core `watermill` package.
+</Note>
+
+## Installation
+
+```bash
+go get github.com/ThreeDotsLabs/watermill-googlecloud/v2
+```
+
+## Characteristics
+
+| Feature               | Supported | Notes                                                         |
+|-----------------------|-----------|---------------------------------------------------------------|
+| ConsumerGroups        | yes       | Multiple subscribers sharing the same Subscription name       |
+| ExactlyOnceDelivery   | no        |                                                               |
+| GuaranteedOrder       | no        |                                                               |
+| Persistent            | yes\*     | Maximum retention time is 7 days                              |
+
+## Configuration
+
+### Publisher config
+
+```go
+type PublisherConfig struct {
+    // ProjectID is your Google Cloud project ID.
+    ProjectID string
+
+    // DoNotCreateTopicIfMissing disables automatic topic creation.
+    DoNotCreateTopicIfMissing bool
+
+    // ConnectTimeout is the timeout for connecting to Google Cloud.
+    ConnectTimeout time.Duration
+
+    // PublishTimeout is the timeout for individual publish calls.
+    PublishTimeout time.Duration
+
+    // Marshaler serializes Watermill messages for Google Cloud Pub/Sub.
+    Marshaler Marshaler
+}
+```
+
+### Subscriber config
+
+```go
+type SubscriberConfig struct {
+    // ProjectID is your Google Cloud project ID.
+    ProjectID string
+
+    // DoNotCreateSubscriptionIfMissing disables automatic subscription creation.
+    DoNotCreateSubscriptionIfMissing bool
+
+    // DoNotCreateTopicIfMissing disables automatic topic creation.
+    DoNotCreateTopicIfMissing bool
+
+    // ConnectTimeout is the timeout for connecting to Google Cloud.
+    ConnectTimeout time.Duration
+
+    // InitializeTimeout is the timeout for initialising subscriptions.
+    InitializeTimeout time.Duration
+
+    // GenerateSubscriptionName returns the Pub/Sub subscription name for a topic.
+    // Defaults to TopicSubscriptionName (topic name as-is).
+    GenerateSubscriptionName GenerateSubscriptionNameFn
+
+    // ReceiveSettings controls how messages are received (NumGoroutines, MaxMessages, etc.).
+    ReceiveSettings pubsub.ReceiveSettings
+
+    // Unmarshaler deserializes Google Cloud Pub/Sub messages into Watermill messages.
+    Unmarshaler Unmarshaler
+}
+```
+
+## Publisher setup
+
+```go
+import (
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-googlecloud/v2/pkg/googlecloud"
+)
+
+publisher, err := googlecloud.NewPublisher(
+    googlecloud.PublisherConfig{
+        ProjectID: "my-gcp-project",
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+```
+
+## Subscriber setup
+
+```go
+subscriber, err := googlecloud.NewSubscriber(
+    googlecloud.SubscriberConfig{
+        ProjectID:                    "my-gcp-project",
+        GenerateSubscriptionName:     googlecloud.TopicSubscriptionNameWithSuffix("svc-a"),
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer subscriber.Close()
+```
+
+## Usage example
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-googlecloud/v2/pkg/googlecloud"
+    "github.com/ThreeDotsLabs/watermill/message"
+)
+
+func main() {
+    logger := watermill.NewStdLogger(false, false)
+
+    publisher, err := googlecloud.NewPublisher(
+        googlecloud.PublisherConfig{ProjectID: "my-gcp-project"},
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer publisher.Close()
+
+    subscriber, err := googlecloud.NewSubscriber(
+        googlecloud.SubscriberConfig{
+            ProjectID:                "my-gcp-project",
+            GenerateSubscriptionName: googlecloud.TopicSubscriptionNameWithSuffix("svc-a"),
+        },
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer subscriber.Close()
+
+    msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"report_generated"}`))
+    if err := publisher.Publish("reports", msg); err != nil {
+        panic(err)
+    }
+
+    messages, err := subscriber.Subscribe(context.Background(), "reports")
+    if err != nil {
+        panic(err)
+    }
+
+    for msg := range messages {
+        fmt.Printf("Received: %s\n", msg.Payload)
+        msg.Ack()
+    }
+}
+```
+
+## Subscription naming
+
+Google Cloud Pub/Sub uses explicit subscription names. Watermill creates subscriptions automatically when `Subscribe()` is called. The subscription name is generated by the function set in `SubscriberConfig.GenerateSubscriptionName`.
+
+| Helper function                       | Behaviour                                                               |
+|---------------------------------------|-------------------------------------------------------------------------|
+| `TopicSubscriptionName`               | Subscription name equals the topic name (default)                       |
+| `TopicSubscriptionNameWithSuffix(s)`  | Subscription name is `<topic>_<suffix>` — use for independent consumers |
+
+When multiple services subscribe to the same topic, give each service its own suffix so each gets its own subscription and therefore its own independent copy of every message.
+
+## Authentication
+
+Watermill connects using the standard [Application Default Credentials](https://cloud.google.com/docs/authentication/application-default-credentials) mechanism:
+
+- **Production** — set the `GOOGLE_APPLICATION_CREDENTIALS` environment variable to a service account key file, or use Workload Identity on GKE.
+- **Development** — run the [Google Cloud Pub/Sub emulator](https://cloud.google.com/pubsub/docs/emulator) and set `PUBSUB_EMULATOR_HOST=localhost:8085`.
+
+Watermill will create missing topics and subscriptions automatically provided the configured credentials have the necessary IAM permissions.
+
+## Marshaler
+
+Watermill messages are mapped to Google Cloud Pub/Sub messages by a `Marshaler`. The default `DefaultMarshalerUnmarshaler` stores the payload as the Pub/Sub message data and encodes UUID and metadata as Pub/Sub message attributes.
+
+## Key considerations
+
+- **Retention** — messages are retained for up to 7 days. Messages older than the retention period are discarded.
+- **At-least-once delivery** — Google Cloud Pub/Sub may deliver a message more than once. Design consumers to be idempotent.
+- **Independent consumers** — use `TopicSubscriptionNameWithSuffix` to give each consumer group its own subscription.
+- **Examples** — see the [Watermill Google Cloud example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/pubsubs/googlecloud) for a runnable demo.

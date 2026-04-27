@@ -1,0 +1,168 @@
+---
+title: "GoChannel in-process Pub/Sub for Watermill"
+description: "The built-in GoChannel backend runs entirely in-process using Go channels — no broker, no network, no extra dependencies required."
+---
+
+GoChannel is the simplest Pub/Sub implementation in Watermill. It uses Go channels and goroutines to route messages within a single process. Because there is no network or serialization overhead, it is also the fastest backend — over 315,000 messages per second in benchmarks.
+
+GoChannel ships inside the core `watermill` module, so no additional dependency is required.
+
+<Note>
+GoChannel has **no global state**. The publisher and subscriber must share the same `*GoChannel` instance. It is not suitable for multi-process or distributed deployments.
+</Note>
+
+## Installation
+
+GoChannel is built into the main `watermill` module. No extra `go get` is needed:
+
+```bash
+go get github.com/ThreeDotsLabs/watermill
+```
+
+## Characteristics
+
+| Feature               | Supported | Notes                                                                    |
+|-----------------------|-----------|--------------------------------------------------------------------------|
+| ConsumerGroups        | no        | Every subscriber receives every message                                  |
+| ExactlyOnceDelivery   | yes       |                                                                          |
+| GuaranteedOrder       | yes       | When `Persistent` is false; order is not guaranteed in persistent mode   |
+| Persistent            | no\*      | Optional in-memory persistence via `Persistent: true`                    |
+
+## Configuration
+
+```go
+type Config struct {
+    // OutputChannelBuffer is the buffer size of the output channel for each
+    // subscriber. A value of 0 means the channel is unbuffered.
+    OutputChannelBuffer int64
+
+    // Persistent enables in-memory message persistence.
+    // When true, new subscribers receive all previously published messages
+    // for a topic. Messages are kept in a slice — large volumes will consume
+    // significant memory.
+    Persistent bool
+
+    // BlockPublishUntilSubscriberAck makes Publish() block until every
+    // active subscriber has acknowledged the message.
+    // When there are no subscribers, Publish() returns immediately even if
+    // Persistent is true.
+    BlockPublishUntilSubscriberAck bool
+
+    // PreserveContext forwards the message's context to subscribers.
+    // By default a fresh context is created per delivery so that the publisher's
+    // context cancellation does not affect subscriber processing.
+    // Set to true when you need to propagate tracing spans or deadlines
+    // across publish/subscribe boundaries within a single process.
+    PreserveContext bool
+}
+```
+
+## Creating a GoChannel
+
+```go
+import (
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill/pubsub/gochannel"
+)
+
+pubSub := gochannel.NewGoChannel(
+    gochannel.Config{
+        OutputChannelBuffer:            64,
+        Persistent:                     false,
+        BlockPublishUntilSubscriberAck: false,
+    },
+    watermill.NewStdLogger(false, false),
+)
+defer pubSub.Close()
+```
+
+The same `pubSub` value is passed as both publisher and subscriber.
+
+## Usage example
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill/message"
+    "github.com/ThreeDotsLabs/watermill/pubsub/gochannel"
+)
+
+func main() {
+    logger := watermill.NewStdLogger(false, false)
+
+    pubSub := gochannel.NewGoChannel(
+        gochannel.Config{},
+        logger,
+    )
+    defer pubSub.Close()
+
+    messages, err := pubSub.Subscribe(context.Background(), "events")
+    if err != nil {
+        panic(err)
+    }
+
+    go func() {
+        for msg := range messages {
+            fmt.Printf("Received: %s\n", msg.Payload)
+            msg.Ack()
+        }
+    }()
+
+    msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"user_created"}`))
+    if err := pubSub.Publish("events", msg); err != nil {
+        panic(err)
+    }
+}
+```
+
+## Persistent mode
+
+When `Persistent` is set to `true`, GoChannel stores all published messages in memory and replays them to any new subscriber that subscribes after the fact:
+
+```go
+pubSub := gochannel.NewGoChannel(
+    gochannel.Config{Persistent: true},
+    logger,
+)
+
+// Publish before subscribing
+pubSub.Publish("history", message.NewMessage(watermill.NewUUID(), []byte("msg-1")))
+pubSub.Publish("history", message.NewMessage(watermill.NewUUID(), []byte("msg-2")))
+
+// Late subscriber receives both historical messages
+msgs, _ := pubSub.Subscribe(context.Background(), "history")
+```
+
+<Warning>
+In persistent mode all messages are held in a `[]*message.Message` slice for each topic. There is no eviction. Memory usage grows unboundedly with message volume.
+</Warning>
+
+## Blocking publish
+
+Set `BlockPublishUntilSubscriberAck: true` when you need synchronous acknowledgement before `Publish()` returns:
+
+```go
+pubSub := gochannel.NewGoChannel(
+    gochannel.Config{BlockPublishUntilSubscriberAck: true},
+    logger,
+)
+```
+
+`Publish()` will block until every active subscriber Acks the message. If there are no subscribers, it returns immediately.
+
+## Marshaler
+
+No marshaling is needed. Messages travel as `*message.Message` pointers in memory — no serialization or deserialization occurs.
+
+## Key considerations
+
+- **Single process only** — messages never leave the process. Use a network-backed backend for multi-process systems.
+- **Fan-out by default** — every subscriber on a topic receives every message. There are no consumer groups.
+- **Highest throughput** — GoChannel is the fastest Watermill backend because there is no I/O overhead.
+- **Testing** — GoChannel is an excellent choice for unit tests where you want to verify message flows without external infrastructure.
+- **Examples** — see the [Watermill GoChannel example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/pubsubs/go-channel) for a runnable demo.

@@ -1,0 +1,220 @@
+---
+title: "Testing Watermill applications and pub/subs"
+description: "Unit-test handlers with GoChannel, validate any Pub/Sub with the shared conformance suite, and catch race conditions with the parallel stress test runner."
+---
+
+Watermill provides a layered testing story: lightweight unit tests with the in-process `GoChannel` backend, a universal conformance suite for validating any Pub/Sub implementation, and parallel stress tests for catching race conditions. This page covers all three layers and points to the debugging tools available when tests go wrong.
+
+## Unit testing handlers with GoChannel
+
+For handler-level tests you do not need a running broker. The `gochannel.GoChannel` backend sends messages through Go channels inside the same process, so tests are fast, deterministic, and dependency-free.
+
+```go
+package handler_test
+
+import (
+    "context"
+    "testing"
+
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill/message"
+    "github.com/ThreeDotsLabs/watermill/pubsub/gochannel"
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/require"
+)
+
+func TestMyHandler(t *testing.T) {
+    logger := watermill.NewStdLogger(false, false)
+
+    pubSub := gochannel.NewGoChannel(
+        gochannel.Config{OutputChannelBuffer: 100},
+        logger,
+    )
+    defer pubSub.Close()
+
+    // Subscribe before publishing so no messages are dropped.
+    msgs, err := pubSub.Subscribe(context.Background(), "output-topic")
+    require.NoError(t, err)
+
+    // Publish an input message.
+    input := message.NewMessage(watermill.NewUUID(), []byte(`{"value":42}`))
+    require.NoError(t, pubSub.Publish("input-topic", input))
+
+    // ... wire up and run your handler here ...
+
+    // Read the output message.
+    select {
+    case msg := <-msgs:
+        assert.Equal(t, []byte(`{"result":42}`), msg.Payload)
+        msg.Ack()
+    case <-time.After(time.Second):
+        t.Fatal("timed out waiting for output message")
+    }
+}
+```
+
+<Tip>
+Set `Persistent: true` on the `GoChannel` config when your test subscribes after publishing. Without persistence, messages published before a subscriber is registered are discarded.
+</Tip>
+
+### GoChannel configuration options
+
+```go
+type Config struct {
+    // Output channel buffer size.
+    OutputChannelBuffer int64
+
+    // When true, all previously published messages are delivered to new subscribers.
+    // Messages are kept in memory, so large volumes can exhaust heap space.
+    Persistent bool
+
+    // When true, Publish blocks until the subscriber Acks the message.
+    BlockPublishUntilSubscriberAck bool
+
+    // When true, the message context is forwarded to the subscriber.
+    // Network-based Pub/Subs cannot preserve context, so this flag exists
+    // to keep in-process tests realistic.
+    PreserveContext bool
+}
+```
+
+## The universal Pub/Sub test suite
+
+`pubsub/tests.TestPubSub` is a conformance suite that every Watermill Pub/Sub implementation should pass. It runs 15 individual scenarios in parallel — plus an optional consumer-group scenario — covering:
+
+- Basic publish and subscribe
+- Concurrent subscribers on the same topic
+- Concurrent subscribers across multiple topics
+- Re-delivery on `Nack` (`TestResendOnError`)
+- Behaviour when a subscriber is closed mid-stream
+- Concurrent `Close()` calls
+- Message ordering (when `GuaranteedOrder` is declared)
+- Publisher `Close()` flushing
+- Context cancellation propagation
+- Topic isolation
+- Reconnect after broker restart
+
+### Function signature
+
+```go
+func TestPubSub(
+    t *testing.T,
+    features Features,
+    pubSubConstructor PubSubConstructor,
+    consumerGroupPubSubConstructor ConsumerGroupPubSubConstructor,
+)
+```
+
+### What TestPublishSubscribe verifies
+
+`TestPublishSubscribe` is the foundational scenario. It publishes 100 messages with unique UUIDs and metadata, then asserts that every message is received exactly once with its payload and metadata intact:
+
+```go
+func TestPublishSubscribe(
+    t *testing.T,
+    tCtx TestContext,
+    pubSubConstructor PubSubConstructor,
+) {
+    pub, sub := pubSubConstructor(t)
+
+    topicName := testTopicName(tCtx)
+
+    // ...publish 100 messages with UUIDs and metadata...
+
+    messages, err := sub.Subscribe(context.Background(), topicName)
+    require.NoError(t, err)
+
+    receivedMessages, all := bulkRead(tCtx, messages, len(messagesToPublish), defaultTimeout*3)
+    assert.True(t, all)
+
+    AssertAllMessagesReceived(t, messagesToPublish, receivedMessages)
+    AssertMessagesPayloads(t, messagesPayloads, receivedMessages)
+    AssertMessagesMetadata(t, "test", messagesTestMetadata, receivedMessages)
+
+    closePubSub(t, pub, sub)
+    assertMessagesChannelClosed(t, messages)
+}
+```
+
+### Declaring features
+
+The `Features` struct tells the suite which capabilities your implementation supports, skipping or adjusting scenarios accordingly:
+
+```go
+tests.TestPubSub(
+    t,
+    tests.Features{
+        ConsumerGroups:        true,
+        ExactlyOnceDelivery:   false,
+        GuaranteedOrder:       true,
+        Persistent:            true,
+        RestartServiceCommand: []string{"docker", "restart", "my-broker"},
+    },
+    createPubSub,
+    createConsumerGroupPubSub,
+)
+```
+
+### Using the suite against GoChannel
+
+The GoChannel implementation's own test file shows the minimal wiring:
+
+```go
+func createPersistentPubSub(t *testing.T) (message.Publisher, message.Subscriber) {
+    pubSub := gochannel.NewGoChannel(
+        gochannel.Config{
+            OutputChannelBuffer: 10000,
+            Persistent:          true,
+        },
+        watermill.NewStdLogger(true, true),
+    )
+    return pubSub, pubSub
+}
+
+func TestPublishSubscribe_persistent(t *testing.T) {
+    tests.TestPubSub(
+        t,
+        tests.Features{
+            ConsumerGroups:        false,
+            ExactlyOnceDelivery:   true,
+            GuaranteedOrder:       false,
+            Persistent:            false,
+            RequireSingleInstance: true,
+        },
+        createPersistentPubSub,
+        nil,
+    )
+}
+```
+
+## Stress testing and race condition detection
+
+`TestPubSubStressTest` runs the full conformance suite 10 times in parallel. Override the count with `STRESS_TEST_COUNT`:
+
+```go
+func TestMyPubSubStress(t *testing.T) {
+    tests.TestPubSubStressTest(
+        t,
+        tests.Features{Persistent: true},
+        createPubSub,
+        nil,
+    )
+}
+```
+
+```bash
+# Run 20 parallel repetitions with the race detector
+STRESS_TEST_COUNT=20 go test -race -run TestMyPubSubStress ./...
+```
+
+<Warning>
+Always run stress tests with `-race`. The Go race detector catches data races that only surface under concurrency, and Pub/Sub implementations are particularly prone to them in `Publish`, `Subscribe`, and `Close` interactions.
+</Warning>
+
+## Running a single test case
+
+```bash
+go test -v ./... -run TestPublishSubscribe/TestContinueAfterSubscribeClose
+```
+
+Each test case runs under a unique UUID sub-test name (e.g., `TestPublishSubscribe/TestPublishSubscribe/81eeb56c-3336-4eb9-a0ac-13abda6f38ff`). You can grep log output by that UUID to isolate a specific run — see [Troubleshooting](/going-further/troubleshooting) for details.

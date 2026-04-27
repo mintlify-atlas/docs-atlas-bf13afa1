@@ -1,0 +1,214 @@
+---
+title: "Redis Streams Pub/Sub for Watermill"
+description: "Connect Watermill to Redis Streams for fast, persistent messaging with consumer group support and XREAD fan-out for broadcasting to multiple subscribers."
+---
+
+Redis Streams is a data structure in Redis that behaves like an append-only log. It supports consumer groups for distributed message processing and fan-out for broadcasting to multiple subscribers. The Watermill Redis Streams adapter is backed by [redis/go-redis](https://github.com/redis/go-redis).
+
+<Note>
+This backend lives in a separate module: [`github.com/ThreeDotsLabs/watermill-redisstream`](https://github.com/ThreeDotsLabs/watermill-redisstream). You need to install it in addition to the core `watermill` package.
+</Note>
+
+## Installation
+
+```bash
+go get github.com/ThreeDotsLabs/watermill-redisstream
+```
+
+## Characteristics
+
+| Feature               | Supported | Notes                                                             |
+|-----------------------|-----------|-------------------------------------------------------------------|
+| ConsumerGroups        | yes       |                                                                   |
+| ExactlyOnceDelivery   | no        |                                                                   |
+| GuaranteedOrder       | no        |                                                                   |
+| Persistent            | yes       |                                                                   |
+| FanOut                | yes       | Uses `XREAD` when no consumer group is configured                 |
+
+## Configuration
+
+### Publisher config
+
+```go
+type PublisherConfig struct {
+    // Client is a go-redis client (redis.Client or redis.ClusterClient).
+    Client redis.UniversalClient
+
+    // Marshaler serializes Watermill messages for storage in Redis.
+    // Defaults to DefaultMarshallerUnmarshaller (MessagePack).
+    Marshaler Marshaler
+
+    // MaxLen is the maximum length of the stream (0 = no limit).
+    MaxLen int64
+
+    // Approx allows approximate trimming using MAXLEN ~ for better performance.
+    Approx bool
+}
+```
+
+### Subscriber config
+
+```go
+type SubscriberConfig struct {
+    // Client is a go-redis client (redis.Client or redis.ClusterClient).
+    Client redis.UniversalClient
+
+    // Unmarshaler deserializes Redis stream entries into Watermill messages.
+    Unmarshaler Unmarshaler
+
+    // Consumer is the consumer name within the group.
+    Consumer string
+
+    // ConsumerGroup is the name of the Redis consumer group.
+    // Leave empty to use XREAD (fan-out mode, no group).
+    ConsumerGroup string
+
+    // ReadTimeout is the XREADGROUP blocking timeout.
+    ReadTimeout time.Duration
+
+    // MaxIdleTime is how long before a pending message is considered idle
+    // and can be claimed by another consumer.
+    MaxIdleTime time.Duration
+
+    // ClaimInterval controls how frequently the subscriber claims idle messages.
+    ClaimInterval time.Duration
+
+    // NackResendSleep is the sleep duration before re-sending a Nacked message.
+    NackResendSleep time.Duration
+
+    // InitializeTimeout is the timeout for initialising the consumer group.
+    InitializeTimeout time.Duration
+}
+```
+
+## Publisher setup
+
+```go
+import (
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-redisstream/pkg/redisstream"
+    "github.com/redis/go-redis/v9"
+)
+
+rdb := redis.NewClient(&redis.Options{
+    Addr: "localhost:6379",
+})
+
+publisher, err := redisstream.NewPublisher(
+    redisstream.PublisherConfig{
+        Client: rdb,
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+```
+
+## Subscriber setup
+
+```go
+rdb := redis.NewClient(&redis.Options{
+    Addr: "localhost:6379",
+})
+
+subscriber, err := redisstream.NewSubscriber(
+    redisstream.SubscriberConfig{
+        Client:        rdb,
+        ConsumerGroup: "my-service",
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer subscriber.Close()
+```
+
+<Tip>
+Pass a `redis.ClusterClient` instead of `redis.Client` to use a Redis Cluster without any other configuration changes.
+</Tip>
+
+## Usage example
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-redisstream/pkg/redisstream"
+    "github.com/ThreeDotsLabs/watermill/message"
+    "github.com/redis/go-redis/v9"
+)
+
+func main() {
+    logger := watermill.NewStdLogger(false, false)
+
+    rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+
+    publisher, err := redisstream.NewPublisher(
+        redisstream.PublisherConfig{Client: rdb},
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer publisher.Close()
+
+    subscriber, err := redisstream.NewSubscriber(
+        redisstream.SubscriberConfig{
+            Client:        rdb,
+            ConsumerGroup: "svc-a",
+        },
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer subscriber.Close()
+
+    msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"payment_received"}`))
+    if err := publisher.Publish("payments", msg); err != nil {
+        panic(err)
+    }
+
+    messages, err := subscriber.Subscribe(context.Background(), "payments")
+    if err != nil {
+        panic(err)
+    }
+
+    for msg := range messages {
+        fmt.Printf("Received: %s\n", msg.Payload)
+        msg.Ack()
+    }
+}
+```
+
+## Fan-out mode
+
+When `ConsumerGroup` is left empty, the subscriber uses Redis `XREAD` instead of `XREADGROUP`. In this mode every subscriber receives every message independently — useful for broadcast scenarios:
+
+```go
+subscriber, err := redisstream.NewSubscriber(
+    redisstream.SubscriberConfig{
+        Client: rdb,
+        // No ConsumerGroup → fan-out via XREAD
+    },
+    logger,
+)
+```
+
+## Marshaler
+
+Watermill messages cannot be stored in Redis directly. The default `DefaultMarshallerUnmarshaller` uses [MessagePack](https://msgpack.org/) for compact, efficient serialization. You can implement the `Marshaler` / `Unmarshaler` interfaces to use a different format.
+
+## Key considerations
+
+- **At-least-once delivery** — messages are redelivered if not acknowledged within `MaxIdleTime`. Design consumers to handle duplicates.
+- **Stream trimming** — set `MaxLen` and `Approx` on `PublisherConfig` to cap stream growth. Without trimming, the stream grows indefinitely.
+- **Cluster support** — use `redis.ClusterClient` for Redis Cluster deployments.
+- **Examples** — see the [Watermill Redis Streams example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/pubsubs/redisstream) for a runnable demo.

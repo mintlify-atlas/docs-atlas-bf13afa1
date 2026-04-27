@@ -1,0 +1,308 @@
+---
+title: "AWS SNS and SQS Pub/Sub for Watermill"
+description: "Connect Watermill to Amazon SQS for task queues and SNS for fan-out broadcasting, with automatic queue creation and LocalStack support for local development."
+---
+
+AWS SQS (Simple Queue Service) and SNS (Simple Notification Service) are fully-managed messaging services from Amazon Web Services. Watermill's `watermill-aws` adapter abstracts both services behind the standard `Publisher` / `Subscriber` interface, handling queue creation, subscription management, and message routing automatically.
+
+<Note>
+This backend lives in a separate module: [`github.com/ThreeDotsLabs/watermill-aws`](https://github.com/ThreeDotsLabs/watermill-aws). You need to install it in addition to the core `watermill` package.
+</Note>
+
+## Installation
+
+```bash
+go get github.com/ThreeDotsLabs/watermill-aws
+```
+
+## SQS vs SNS
+
+<AccordionGroup>
+  <Accordion title="When to use SQS">
+    SQS is a point-to-point queue. A single consumer (or a pool of workers sharing the same queue) processes each message. Use SQS when:
+
+    - You need a task queue or background job processor.
+    - A single consumer group should handle each message.
+    - You want FIFO ordering or exactly-once processing (FIFO queues).
+
+    **Example:** Processing uploaded files in the background.
+  </Accordion>
+  <Accordion title="When to use SNS">
+    SNS is a pub/sub broadcast service. When you publish to an SNS topic, every subscriber receives a copy. Watermill automatically creates an SQS queue per subscriber and wires it to the SNS topic. Use SNS when:
+
+    - Multiple independent services must each react to the same event.
+    - You are building an event-driven or fan-out architecture.
+
+    **Example:** Notifying multiple services when a new user registers.
+  </Accordion>
+</AccordionGroup>
+
+You can mix both in the same application — use SNS to broadcast events and SQS to process specific tasks triggered by those events.
+
+## SQS
+
+### Characteristics
+
+| Feature               | Supported | Notes                                                                                                    |
+|-----------------------|-----------|----------------------------------------------------------------------------------------------------------|
+| ConsumerGroups        | no        | Use SNS for consumer group-like fan-out                                                                  |
+| ExactlyOnceDelivery   | no\*      | Available with [FIFO queues](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues-exactly-once-processing.html) |
+| GuaranteedOrder       | yes\*     | Best-effort; standard queues may deliver duplicates or out-of-order messages                             |
+| Persistent            | yes       |                                                                                                          |
+
+### Required IAM permissions
+
+```
+sqs:ReceiveMessage
+sqs:DeleteMessage
+sqs:GetQueueUrl
+sqs:CreateQueue
+sqs:GetQueueAttributes
+sqs:SendMessage
+sqs:ChangeMessageVisibility
+```
+
+### SQS publisher setup
+
+```go
+import (
+    "context"
+
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-aws/sqs"
+    "github.com/aws/aws-sdk-go-v2/config"
+)
+
+cfg, err := config.LoadDefaultConfig(context.Background())
+if err != nil {
+    panic(err)
+}
+
+publisher, err := sqs.NewPublisher(
+    sqs.PublisherConfig{AWSConfig: cfg},
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+```
+
+### SQS subscriber setup
+
+```go
+subscriber, err := sqs.NewSubscriber(
+    sqs.SubscriberConfig{AWSConfig: cfg},
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer subscriber.Close()
+```
+
+### Queue URL resolution
+
+In Watermill the `topic` parameter maps to an SQS queue. By default, Watermill resolves the queue URL by name using `GetQueueUrlByNameUrlResolver`. You can change this:
+
+```go
+// Use the queue name as-is to look up the URL from AWS
+sqs.SubscriberConfig{
+    AWSConfig:       cfg,
+    QueueUrlResolver: sqs.NewGetQueueUrlByNameUrlResolver(),
+}
+
+// Supply the full URL directly as the topic (no lookup)
+sqs.SubscriberConfig{
+    AWSConfig:       cfg,
+    QueueUrlResolver: sqs.TransparentUrlResolver{},
+}
+
+// Generate the URL from an account/region pattern without an API call
+sqs.SubscriberConfig{
+    AWSConfig:       cfg,
+    QueueUrlResolver: sqs.GenerateQueueUrlResolver{
+        Region:    "us-east-1",
+        AccountID: "123456789012",
+    },
+}
+```
+
+### Using a local SQS emulator
+
+For development and testing you can use [goaws](https://github.com/Admiral-Piett/goaws) or [LocalStack](https://hub.docker.com/r/localstack/localstack):
+
+```go
+import amazonsqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+
+sqsOpts := []func(*amazonsqs.Options){
+    amazonsqs.WithEndpointResolverV2(sqs.OverrideEndpointResolver{
+        Endpoint: transport.Endpoint{
+            URI: *lo.Must(url.Parse("http://localhost:4566")),
+        },
+    }),
+}
+
+sqsConfig := sqs.SubscriberConfig{
+    AWSConfig: cfg,
+    OptFns:    sqsOpts,
+}
+```
+
+---
+
+## SNS
+
+### Characteristics
+
+| Feature               | Supported | Notes                                                                    |
+|-----------------------|-----------|--------------------------------------------------------------------------|
+| ConsumerGroups        | yes       | Each subscription (SQS queue) acts as an independent consumer group      |
+| ExactlyOnceDelivery   | no        |                                                                          |
+| GuaranteedOrder       | yes\*     | Best-effort ordering inherited from underlying SQS queues                |
+| Persistent            | yes       |                                                                          |
+
+### Required IAM permissions
+
+In addition to all SQS permissions listed above:
+
+```
+sns:Subscribe
+sns:ConfirmSubscription
+sns:Receive
+sns:Unsubscribe
+sqs:SetQueueAttributes   (unless DoNotSetQueueAccessPolicy is true)
+```
+
+### How SNS and SQS connect
+
+When you call `Subscribe()` on an SNS topic, Watermill:
+1. Creates an SQS queue for this subscriber.
+2. Subscribes that queue to the SNS topic.
+3. Polls the SQS queue to deliver messages.
+
+Each unique subscriber gets its own SQS queue, effectively acting as an independent consumer group.
+
+### SNS publisher setup
+
+```go
+import "github.com/ThreeDotsLabs/watermill-aws/sns"
+
+publisher, err := sns.NewPublisher(
+    sns.PublisherConfig{AWSConfig: cfg},
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+```
+
+### SNS subscriber setup
+
+```go
+snsSubscriber, err := sns.NewSubscriber(
+    sns.SubscriberConfig{AWSConfig: cfg},
+    sqs.SubscriberConfig{AWSConfig: cfg},
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer snsSubscriber.Close()
+```
+
+### Topic ARN resolution
+
+Watermill normalises SNS Topic ARNs to the `topic` parameter in `Publish` and `Subscribe`. Two resolvers are provided:
+
+```go
+// Use the topic string as the full ARN directly
+sns.TransparentTopicResolver{}
+
+// Generate an ARN from account/region/name
+sns.GenerateArnTopicResolver{
+    AccountID: "123456789012",
+    Region:    "us-east-1",
+}
+```
+
+### Using a local SNS emulator
+
+```go
+import amazonsns "github.com/aws/aws-sdk-go-v2/service/sns"
+
+snsOpts := []func(*amazonsns.Options){
+    amazonsns.WithEndpointResolverV2(sns.OverrideEndpointResolver{
+        Endpoint: transport.Endpoint{
+            URI: *lo.Must(url.Parse("http://localhost:4566")),
+        },
+    }),
+}
+
+snsConfig := sns.SubscriberConfig{
+    AWSConfig: cfg,
+    OptFns:    snsOpts,
+}
+```
+
+## Usage example
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    awsconfig "github.com/aws/aws-sdk-go-v2/config"
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-aws/sqs"
+    "github.com/ThreeDotsLabs/watermill/message"
+)
+
+func main() {
+    cfg, _ := awsconfig.LoadDefaultConfig(context.Background())
+    logger := watermill.NewStdLogger(false, false)
+
+    publisher, err := sqs.NewPublisher(
+        sqs.PublisherConfig{AWSConfig: cfg},
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer publisher.Close()
+
+    subscriber, err := sqs.NewSubscriber(
+        sqs.SubscriberConfig{AWSConfig: cfg},
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer subscriber.Close()
+
+    msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"task_submitted"}`))
+    if err := publisher.Publish("my-queue", msg); err != nil {
+        panic(err)
+    }
+
+    messages, err := subscriber.Subscribe(context.Background(), "my-queue")
+    if err != nil {
+        panic(err)
+    }
+
+    for msg := range messages {
+        fmt.Printf("Received: %s\n", msg.Payload)
+        msg.Ack()
+    }
+}
+```
+
+## Key considerations
+
+- **At-least-once delivery** — both SQS and SNS may redeliver messages. Design consumers to be idempotent.
+- **Standard vs FIFO** — use FIFO queues for strict ordering and exactly-once processing at the cost of throughput.
+- **Cost** — AWS charges per API call. High-volume workloads should tune visibility timeout and batch sizes to minimize costs.
+- **Examples** — see the [SNS example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/pubsubs/aws-sns) and [SQS example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/pubsubs/aws-sqs) for runnable demos.

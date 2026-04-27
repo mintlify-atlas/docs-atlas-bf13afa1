@@ -1,0 +1,197 @@
+---
+title: "Forwarder: transactional outbox pattern"
+description: "Atomically publish messages alongside database writes using the Forwarder component, an outbox pattern implementation for reliable event delivery."
+---
+
+In an event-driven system, you often need to persist application state in a database and publish a message about what happened — both as one atomic operation. If you do them separately, a crash between the two steps leaves the system in an inconsistent state.
+
+The **Forwarder** component solves this by implementing the [transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html): write your data and publish to a database-backed topic in a single transaction, then let the Forwarder move messages from the database to your real message broker in the background.
+
+## The problem
+
+Consider a command that picks a lottery winner and must both store the result and emit a `LotteryConcluded` event. Three naive orderings all have failure modes:
+
+- **Publish first, then store** — if the store fails, the event is already out but no winner is recorded.
+- **Store first, then publish** — if the publish fails, the winner is stored but no event is ever sent.
+- **Both independently** — no atomicity at all.
+
+The only safe approach is to commit both in a single transaction.
+
+## How the Forwarder works
+
+The Forwarder is a background component that:
+
+1. Subscribes to a single "forwarder topic" on a database-backed Pub/Sub (e.g., SQL).
+2. Receives enveloped messages published there by a `forwarder.Publisher` decorator.
+3. Unwraps each envelope to get the real destination topic and message.
+4. Publishes the message to the destination topic on your actual message broker.
+
+```
+Application code
+     │
+     ▼
+forwarder.Publisher (wraps DB publisher)
+     │  writes to DB in same transaction as your data
+     ▼
+Database (forwarder_topic)
+     │
+     ▼
+Forwarder component (background)
+     │  reads from DB, publishes to broker
+     ▼
+Message broker (e.g., Google Pub/Sub, Kafka, Redis)
+```
+
+<Note>
+The subscriber passed to `NewForwarder` and the publisher used inside `forwarder.NewPublisher` can be from different Pub/Sub implementations. For example, a MySQL subscriber and a Google Pub/Sub publisher.
+</Note>
+
+## Setup
+
+<Steps>
+
+<Step title="Create a database-backed publisher and wrap it">
+
+Use a transactional Pub/Sub publisher (e.g., from `watermill-sql`) inside a `forwarder.Publisher`. The forwarder publisher wraps each message in an envelope and sends it to the forwarder topic instead of the real destination. The real topic is embedded in the envelope.
+
+```go
+import "github.com/ThreeDotsLabs/watermill/components/forwarder"
+
+// dbPublisher is a publisher that writes to your database
+// (e.g., *sql.Publisher from watermill-sql, used inside a transaction).
+forwarderPublisher := forwarder.NewPublisher(dbPublisher, forwarder.PublisherConfig{
+    ForwarderTopic: "forwarder_topic", // must match Forwarder's ForwarderTopic
+})
+```
+
+`forwarder.PublisherConfig`:
+
+```go
+type PublisherConfig struct {
+    // ForwarderTopic is the topic the Forwarder listens to.
+    // Defaults to "forwarder_topic".
+    ForwarderTopic string
+}
+```
+
+Now publish as normal — the actual destination topic is preserved inside the envelope:
+
+```go
+// This writes to "forwarder_topic" in your DB, not to "my-real-topic" directly.
+err := forwarderPublisher.Publish("my-real-topic", msg)
+```
+
+</Step>
+
+<Step title="Commit data and the enveloped message in one transaction">
+
+Inside a database transaction, call your data persistence logic and then publish through the `forwarder.Publisher`. Because the publisher writes to the same database, both operations commit or roll back atomically.
+
+```go
+tx, err := db.BeginTx(ctx, nil)
+// ... persist your domain data using tx ...
+
+err = forwarderPublisher.Publish("LotteryConcluded", eventMsg)
+// ... if err != nil, roll back tx ...
+
+err = tx.Commit()
+```
+
+</Step>
+
+<Step title="Create and run the Forwarder">
+
+The Forwarder subscribes to the forwarder topic on the database and forwards messages to the broker publisher.
+
+```go
+fwd, err := forwarder.NewForwarder(
+    dbSubscriber,    // reads from the database
+    brokerPublisher, // publishes to the real message broker
+    logger,
+    forwarder.Config{
+        ForwarderTopic: "forwarder_topic",
+    },
+)
+if err != nil {
+    panic(err)
+}
+
+if err := fwd.Run(ctx); err != nil {
+    panic(err)
+}
+```
+
+`Run` is blocking. Call `fwd.Close()` to stop it gracefully.
+
+</Step>
+
+</Steps>
+
+## Forwarder API reference
+
+### `Config`
+
+```go
+type Config struct {
+    // ForwarderTopic is the topic the Forwarder subscribes to.
+    // Defaults to "forwarder_topic".
+    ForwarderTopic string
+
+    // Middlewares are applied to the forwarder's internal handler function.
+    Middlewares []message.HandlerMiddleware
+
+    // CloseTimeout determines how long the router waits for handlers to finish when closing.
+    // Defaults to 30 seconds.
+    CloseTimeout time.Duration
+
+    // AckWhenCannotUnwrap acks messages that cannot be unwrapped from their envelope.
+    // Default: false (nack on unwrap failure).
+    AckWhenCannotUnwrap bool
+
+    // Router is an existing router to attach the forwarder handler to.
+    // If nil, a new router is created internally.
+    // When provided, calling Forwarder.Run() is not necessary if the router is already running.
+    Router *message.Router
+}
+```
+
+### `NewForwarder`
+
+```go
+func NewForwarder(
+    subscriberIn  message.Subscriber,
+    publisherOut  message.Publisher,
+    logger        watermill.LoggerAdapter,
+    config        Config,
+) (*Forwarder, error)
+```
+
+### `Forwarder` methods
+
+```go
+// Run starts the forwarder. Blocks until Close is called or ctx is cancelled.
+func (f *Forwarder) Run(ctx context.Context) error
+
+// Close stops the forwarder gracefully.
+func (f *Forwarder) Close() error
+
+// Running returns a channel that is closed when the forwarder is running.
+func (f *Forwarder) Running() chan struct{}
+```
+
+### `forwarder.Publisher`
+
+```go
+func NewPublisher(publisher message.Publisher, config PublisherConfig) *Publisher
+```
+
+`Publisher.Publish` wraps each message in an envelope and sends it to `ForwarderTopic` on the underlying publisher, regardless of the topic argument. The real destination topic is stored inside the envelope and recovered by the Forwarder.
+
+<Warning>
+By default, the Forwarder nacks any message that was not sent through a `forwarder.Publisher` (i.e., messages that cannot be unwrapped from an envelope). Set `AckWhenCannotUnwrap: true` in the config to ack them instead.
+</Warning>
+
+## Full example
+
+A complete runnable example using MySQL and Google Pub/Sub is available in the Watermill repository:
+[`_examples/real-world-examples/transactional-events-forwarder`](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/real-world-examples/transactional-events-forwarder).

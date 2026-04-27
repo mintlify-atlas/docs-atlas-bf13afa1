@@ -1,0 +1,178 @@
+---
+title: "Fan-in and fan-out message routing patterns"
+description: "Merge multiple topics into one with FanIn, or broadcast a single external subscription to multiple in-process consumers with FanOut using go-channel."
+---
+
+Fan-in and fan-out are two complementary routing patterns for managing message flow across topics. Fan-in consolidates messages from many sources into a single stream; fan-out multiplies a single stream so many consumers can each receive every message.
+
+## Fan-in: merging multiple topics into one
+
+The `fanin.FanIn` component subscribes to one or more source topics and republishes every message it receives onto a single target topic. This is useful when you have producers writing to different topics and downstream consumers that need a unified view.
+
+```
+topic-a ──┐
+topic-b ──┼──► FanIn ──► merged-topic
+topic-c ──┘
+```
+
+### Config
+
+```go
+type Config struct {
+    // SourceTopics contains the topics FanIn subscribes to.
+    SourceTopics []string
+
+    // TargetTopic is where messages from SourceTopics are published.
+    TargetTopic string
+
+    // CloseTimeout determines how long the router waits for handlers when closing.
+    // Defaults to 30 seconds.
+    CloseTimeout time.Duration
+}
+```
+
+### Creating and running FanIn
+
+```go
+func NewFanIn(
+    subscriber message.Subscriber,
+    publisher  message.Publisher,
+    config     fanin.Config,
+    logger     watermill.LoggerAdapter,
+) (*FanIn, error)
+```
+
+The subscriber and publisher can be from different Pub/Sub backends. For example, you can fan-in a Kafka topic and a RabbitMQ topic into a single Redis Streams topic.
+
+```go
+logger := watermill.NewStdLogger(false, false)
+
+fi, err := fanin.NewFanIn(
+    sub,
+    pub,
+    fanin.Config{
+        SourceTopics: []string{"orders.eu", "orders.us", "orders.apac"},
+        TargetTopic:  "orders.all",
+    },
+    logger,
+)
+if err != nil {
+    panic(err)
+}
+
+if err := fi.Run(context.Background()); err != nil {
+    panic(err)
+}
+```
+
+### FanIn methods
+
+```go
+// Run starts the FanIn. Blocks until ctx is cancelled or Close is called.
+func (f *FanIn) Run(ctx context.Context) error
+
+// Running returns a channel that is closed when the FanIn is running.
+func (f *FanIn) Running() chan struct{}
+
+// Close gracefully stops the FanIn.
+func (f *FanIn) Close() error
+```
+
+Stop the FanIn by cancelling the context passed to `Run`, or by calling `Close` directly.
+
+<Note>
+`SourceTopics` must not be empty, must not contain empty strings, and must not include `TargetTopic`. `NewFanIn` validates the config and returns an error if any of these constraints are violated.
+</Note>
+
+---
+
+## Fan-out: broadcasting one topic to many consumers
+
+`gochannel.FanOut` solves the opposite problem. When you have a single external Pub/Sub subscription (e.g., one Kafka consumer), but multiple goroutines or components inside the process need to receive every message, `FanOut` multiplies it for them.
+
+```
+external-sub ──► FanOut ──► subscriber-A
+                        └──► subscriber-B
+                        └──► subscriber-C
+```
+
+`FanOut` implements the standard `message.Subscriber` interface, so you can pass it anywhere a subscriber is accepted.
+
+### Creating FanOut
+
+```go
+func NewFanOut(
+    subscriber message.Subscriber,
+    logger     watermill.LoggerAdapter,
+) (*FanOut, error)
+```
+
+```go
+fanOut, err := gochannel.NewFanOut(externalSubscriber, logger)
+if err != nil {
+    panic(err)
+}
+```
+
+### Registering topics
+
+Call `AddSubscription` for every topic you want to fan out before starting the `FanOut`. This is idempotent — calling it twice for the same topic has no effect.
+
+```go
+// AddSubscription registers a topic to be fanned out.
+// Must be called before Run.
+func (f *FanOut) AddSubscription(topic string)
+```
+
+```go
+fanOut.AddSubscription("payments")
+fanOut.AddSubscription("refunds")
+```
+
+### Running FanOut
+
+```go
+// Run starts the FanOut. Blocks until ctx is cancelled or Close is called.
+func (f *FanOut) Run(ctx context.Context) error
+
+// Running returns a channel closed when the FanOut is running.
+func (f *FanOut) Running() chan struct{}
+
+// Subscribe returns a channel for the given topic from the internal Pub/Sub.
+func (f *FanOut) Subscribe(ctx context.Context, topic string) (<-chan *message.Message, error)
+
+// Close stops the FanOut and its internal Pub/Sub.
+func (f *FanOut) Close() error
+```
+
+After starting, use `fanOut` as a regular subscriber:
+
+```go
+go func() {
+    if err := fanOut.Run(ctx); err != nil {
+        panic(err)
+    }
+}()
+<-fanOut.Running()
+
+// Both consumers receive every message published to "payments".
+msgs1, _ := fanOut.Subscribe(ctx, "payments")
+msgs2, _ := fanOut.Subscribe(ctx, "payments")
+```
+
+<Tip>
+`FanOut` uses an internal `GoChannel` Pub/Sub to distribute messages within the process. All in-process subscribers receive each message independently, but the external subscription is held only once.
+</Tip>
+
+---
+
+## Choosing between FanIn and FanOut
+
+<CardGroup cols={2}>
+  <Card title="FanIn" icon="merge">
+    Use when you have **multiple source topics** that should all feed into a **single downstream topic**. The subscriber and publisher can be from different Pub/Sub backends.
+  </Card>
+  <Card title="FanOut" icon="split">
+    Use when you have **one external subscription** but **multiple in-process consumers** that all need to receive every message. Works with any external subscriber; distribution is done via in-memory Go channels.
+  </Card>
+</CardGroup>

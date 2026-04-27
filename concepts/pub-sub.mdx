@@ -1,0 +1,166 @@
+---
+title: "Publisher and Subscriber interfaces"
+description: "The two interfaces every Watermill backend implements. Understand how to publish messages, consume topics, and handle at-least-once delivery correctly."
+---
+
+Every pub/sub backend in Watermill — Kafka, RabbitMQ, NATS, Redis Streams, and others — satisfies exactly two interfaces: `Publisher` and `Subscriber`. Working against these interfaces means you can swap backends without changing any business logic.
+
+## Publisher
+
+```go
+// Publisher is the emitting part of a Pub/Sub.
+type Publisher interface {
+    // Publish publishes provided messages to the given topic.
+    //
+    // Publish can be synchronous or asynchronous - it depends on the implementation.
+    //
+    // Most publisher implementations don't support atomic publishing of messages.
+    // This means that if publishing one of the messages fails, the next messages
+    // will not be published.
+    //
+    // Publish does not work with a single Context.
+    // Use the Context() method of each message instead.
+    //
+    // Publish must be thread safe.
+    Publish(topic string, messages ...*Message) error
+
+    // Close should flush unsent messages if publisher is async.
+    Close() error
+}
+```
+
+### Publishing multiple messages
+
+`Publish` accepts a variadic list of messages. Most backends do **not** publish them atomically — if one fails, subsequent messages in the same call are not sent. If atomicity matters, publish one message per call, or use a transactional outbox pattern.
+
+### Async publish
+
+Whether `Publish` blocks until the broker confirms receipt depends on the implementation. For async backends, the method may return before the message has been written to the broker. Always call `Close()` before your process exits so the publisher can flush any buffered messages.
+
+```go
+publisher, err := kafka.NewPublisher(sarama.NewConfig(), watermill.NewStdLogger(false, false))
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+
+msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"user_registered"}`))
+if err := publisher.Publish("user-events", msg); err != nil {
+    // handle error
+}
+```
+
+<Warning>
+Forgetting to call `Close()` on an async publisher may cause message loss. The pending buffer will be discarded when the process exits.
+</Warning>
+
+## Subscriber
+
+```go
+// Subscriber is the consuming part of the Pub/Sub.
+type Subscriber interface {
+    // Subscribe returns an output channel with messages from the provided topic.
+    // The channel is closed after Close() is called on the subscriber.
+    //
+    // To receive the next message, Ack() must be called on the received message.
+    // If message processing fails and the message should be redelivered,
+    // Nack() should be called instead.
+    //
+    // When the provided ctx is canceled, the subscriber closes the subscription
+    // and the output channel.
+    // The provided ctx is passed to all produced messages.
+    // When Nack or Ack is called on the message, the context of the message is canceled.
+    Subscribe(ctx context.Context, topic string) (<-chan *Message, error)
+
+    // Close closes all subscriptions with their output channels and
+    // flushes offsets etc. when needed.
+    Close() error
+}
+```
+
+`Subscribe` returns a read-only channel. Each value you receive from it is a `*Message`. The subscriber will not place the next message on the channel until the current one is acknowledged.
+
+```go
+messages, err := subscriber.Subscribe(ctx, "user-events")
+if err != nil {
+    panic(err)
+}
+
+for msg := range messages {
+    log.Printf("received message: %s, payload: %s", msg.UUID, string(msg.Payload))
+
+    // Call Ack to signal successful processing.
+    // The subscriber will then deliver the next message.
+    msg.Ack()
+}
+```
+
+### Ack/Nack mechanism
+
+The subscriber is responsible for waiting for an `Ack` or `Nack` before advancing. A correct implementation must commit the offset or release the lock **only after** it receives an `Ack` from Watermill. Committing early risks losing messages if the process crashes before the handler finishes.
+
+```go
+for msg := range messages {
+    if err := processMessage(msg); err != nil {
+        // Nack causes the message to be redelivered
+        msg.Nack()
+        continue
+    }
+    // Ack commits the offset / releases the lock
+    msg.Ack()
+}
+```
+
+### Closing a subscriber
+
+`Close()` terminates all active subscriptions and closes the output channel. Ranging over a closed channel exits cleanly, so a `for msg := range messages` loop will stop naturally when the subscriber is closed.
+
+## At-least-once delivery
+
+Watermill is built on at-least-once delivery semantics. If processing fails and `Nack()` is sent, the message is redelivered. This means a message may be processed more than once — for example, if the process crashes after the handler succeeds but before `Ack()` is sent.
+
+Design your handlers to be **idempotent**: processing the same message twice should produce the same result as processing it once. Alternatively, use the built-in `Deduplicator` middleware for in-process deduplication.
+
+<Tip>
+There is no universal middleware for deduplication across distributed instances because it requires shared state. Use a database upsert, a Redis SET NX, or a similar mechanism at the application layer.
+</Tip>
+
+## Universal test suite
+
+Every pub/sub implementation is expected to pass a shared test suite that covers ordering, concurrent consumers, reconnection, and other edge cases:
+
+```
+pubsub/tests/test_pubsub.go
+```
+
+If you are building a custom backend, run this suite against your implementation to verify conformance. The tests catch subtle issues with Ack/Nack ordering, context cancellation, and channel closure that are easy to miss in handwritten tests.
+
+## GoChannel: built-in in-process pub/sub
+
+For local development, tests, and simple pipelines that do not need an external broker, Watermill ships `gochannel.GoChannel` — a fully in-process pub/sub built on Go channels.
+
+```go
+import "github.com/ThreeDotsLabs/watermill/pubsub/gochannel"
+
+pubSub := gochannel.NewGoChannel(
+    gochannel.Config{},
+    watermill.NewStdLogger(false, false),
+)
+```
+
+`GoChannel` satisfies both `Publisher` and `Subscriber`, so you can pass the same instance to both sides. It is useful in the getting-started examples and in unit tests where you want to avoid network dependencies.
+
+## SubscribeInitializer
+
+Some backends require a topic to be created before a subscriber can listen to it. The optional `SubscribeInitializer` interface provides a hook for that:
+
+```go
+// SubscribeInitializer is used to initialize subscribers.
+type SubscribeInitializer interface {
+    // SubscribeInitialize can be called to initialize subscribe before consume.
+    // Not every Pub/Sub requires this initialization.
+    SubscribeInitialize(topic string) error
+}
+```
+
+Not all backends implement this interface. Check the specific backend's documentation to see whether it is required.

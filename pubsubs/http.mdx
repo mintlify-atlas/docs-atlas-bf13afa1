@@ -1,0 +1,218 @@
+---
+title: "HTTP Pub/Sub for Watermill webhooks"
+description: "Receive incoming webhooks as Watermill messages and send outgoing HTTP requests as published messages using the watermill-http adapter."
+---
+
+The HTTP backend bridges Watermill's message model with the HTTP protocol. The **subscriber** listens for incoming HTTP requests (webhooks) and delivers them as messages into your pipeline. The **publisher** sends outgoing HTTP requests for each message it receives. This lets you integrate webhooks, APIs, and HTTP-based callbacks into an event-driven architecture.
+
+<Note>
+This backend lives in a separate module: [`github.com/ThreeDotsLabs/watermill-http`](https://github.com/ThreeDotsLabs/watermill-http). You need to install it in addition to the core `watermill` package.
+</Note>
+
+## Installation
+
+```bash
+go get github.com/ThreeDotsLabs/watermill-http/v2
+```
+
+## Characteristics
+
+| Feature               | Supported | Notes |
+|-----------------------|-----------|-------|
+| ConsumerGroups        | no        |       |
+| ExactlyOnceDelivery   | yes       |       |
+| GuaranteedOrder       | yes       |       |
+| Persistent            | no        |       |
+
+## Subscriber configuration
+
+```go
+type SubscriberConfig struct {
+    // Router is an optional chi.Router to mount the HTTP handler on.
+    // Useful for adding health check or other custom endpoints.
+    Router chi.Router
+
+    // UnmarshalMessageFunc controls how an HTTP request becomes a Watermill message.
+    UnmarshalMessageFunc UnmarshalMessageFunc
+}
+```
+
+## Publisher configuration
+
+```go
+type PublisherConfig struct {
+    // MarshalMessageFunc controls how a Watermill message becomes an HTTP request.
+    MarshalMessageFunc MarshalMessageFunc
+
+    // Client is the HTTP client used to send requests.
+    // When nil, http.DefaultClient is used.
+    Client *http.Client
+
+    // DoNotLogResponseBodyOnServerError suppresses logging response bodies on 4xx/5xx.
+    DoNotLogResponseBodyOnServerError bool
+}
+```
+
+The `MarshalMessageFunc` maps a Watermill message to an `*http.Request`. The built-in `DefaultMarshalMessageFunc` sends a `POST` request to the topic URL with the message payload as the request body:
+
+```go
+func DefaultMarshalMessageFunc(topic string, msg *message.Message) (*http.Request, error) {
+    req, err := http.NewRequest(http.MethodPost, topic, bytes.NewBuffer(msg.Payload))
+    if err != nil {
+        return nil, err
+    }
+    return req, nil
+}
+```
+
+When using `DefaultMarshalMessageFunc`, the **topic** passed to `Publish()` is the full URL of the destination endpoint.
+
+## Subscriber setup
+
+```go
+import (
+    "github.com/ThreeDotsLabs/watermill"
+    httpwatermill "github.com/ThreeDotsLabs/watermill-http/v2/pkg/http"
+)
+
+subscriber, err := httpwatermill.NewSubscriber(
+    ":8080",
+    httpwatermill.SubscriberConfig{},
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+```
+
+## Publisher setup
+
+```go
+publisher, err := httpwatermill.NewPublisher(
+    httpwatermill.PublisherConfig{
+        MarshalMessageFunc: httpwatermill.DefaultMarshalMessageFunc,
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+```
+
+## Starting the HTTP server
+
+After registering subscriptions, you must call `StartHTTPServer()` explicitly. When using a Watermill router, wait for the router to be running first:
+
+```go
+router, err := message.NewRouter(message.RouterConfig{}, logger)
+// ... add handlers ...
+
+go func() {
+    if err := router.Run(context.Background()); err != nil {
+        panic(err)
+    }
+}()
+
+<-router.Running()
+subscriber.StartHTTPServer()
+```
+
+## Usage example
+
+This example subscribes to an HTTP endpoint and forwards incoming webhook payloads to a second service via HTTP publish:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "net/http"
+
+    "github.com/ThreeDotsLabs/watermill"
+    httpwatermill "github.com/ThreeDotsLabs/watermill-http/v2/pkg/http"
+    "github.com/ThreeDotsLabs/watermill/message"
+)
+
+func main() {
+    logger := watermill.NewStdLogger(false, false)
+
+    subscriber, err := httpwatermill.NewSubscriber(
+        ":8080",
+        httpwatermill.SubscriberConfig{},
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+
+    publisher, err := httpwatermill.NewPublisher(
+        httpwatermill.PublisherConfig{
+            MarshalMessageFunc: httpwatermill.DefaultMarshalMessageFunc,
+        },
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer publisher.Close()
+
+    messages, err := subscriber.Subscribe(context.Background(), "/webhooks/orders")
+    if err != nil {
+        panic(err)
+    }
+
+    // Start listening
+    go subscriber.StartHTTPServer()
+
+    for msg := range messages {
+        fmt.Printf("Received webhook: %s\n", msg.Payload)
+
+        // Forward to another service using HTTP publish
+        fwd := message.NewMessage(watermill.NewUUID(), msg.Payload)
+        if err := publisher.Publish("http://downstream-service/events", fwd); err != nil {
+            msg.Nack()
+            continue
+        }
+        msg.Ack()
+    }
+}
+```
+
+## Custom HTTP status codes
+
+To return a specific HTTP status code from a subscriber handler, use `SetResponseStatusCode` before calling `Nack()`:
+
+```go
+httpwatermill.SetResponseStatusCode(msg, http.StatusUnprocessableEntity)
+msg.Nack()
+```
+
+This is useful for communicating validation failures back to the webhook sender.
+
+## Custom router
+
+Pass your own `chi.Router` to `SubscriberConfig.Router` if you need to register additional endpoints (health checks, metrics, authentication middleware, etc.) alongside the subscriber:
+
+```go
+import "github.com/go-chi/chi/v5"
+
+r := chi.NewRouter()
+r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+    w.WriteHeader(http.StatusOK)
+})
+
+subscriber, err := httpwatermill.NewSubscriber(
+    ":8080",
+    httpwatermill.SubscriberConfig{Router: r},
+    logger,
+)
+```
+
+## Key considerations
+
+- **No persistence** — HTTP messages are not stored. If the subscriber is down when a webhook fires, the message is lost.
+- **Exactly-once** — Ack returns HTTP 200; Nack re-runs the handler. The sender must retry for delivery guarantees.
+- **Message ordering** — guaranteed within a single HTTP connection; not guaranteed across parallel requests.
+- **Examples** — see [receiving webhooks](https://github.com/ThreeDotsLabs/watermill/blob/master/_examples/real-world-examples/receiving-webhooks/main.go) and [sending webhooks](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/real-world-examples/sending-webhooks) for runnable demos.

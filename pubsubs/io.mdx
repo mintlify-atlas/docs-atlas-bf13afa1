@@ -1,0 +1,232 @@
+---
+title: "io.Reader / io.Writer Pub/Sub for Watermill"
+description: "Wrap any Go stdlib io.Writer or io.Reader as a Watermill Publisher or Subscriber to write messages to files, stdin, stdout, or any stream."
+---
+
+The `watermill-io` adapter wraps Go's standard library `io.Writer` and `io.Reader` interfaces as a Watermill `Publisher` and `Subscriber` respectively. Because virtually every I/O abstraction in Go implements one of these interfaces, this adapter lets you integrate files, standard input/output, network streams, or third-party libraries into a Watermill pipeline with minimal glue code.
+
+This is an experimental implementation and does not provide the durability or delivery guarantees of a full message broker. It is well suited for:
+
+- Writing messages to a log file or `os.Stdout` for debugging.
+- Reading from `os.Stdin` or a file and packaging the data as messages.
+- Interfacing with libraries that expose an `io.Writer` or `io.Reader`, such as [github.com/colinmarc/hdfs](https://github.com/colinmarc/hdfs) or archive libraries.
+
+<Note>
+This backend lives in a separate module: [`github.com/ThreeDotsLabs/watermill-io`](https://github.com/ThreeDotsLabs/watermill-io). You need to install it in addition to the core `watermill` package.
+</Note>
+
+## Installation
+
+```bash
+go get github.com/ThreeDotsLabs/watermill-io
+```
+
+## Characteristics
+
+| Feature               | Supported | Notes |
+|-----------------------|-----------|-------|
+| ConsumerGroups        | no        |       |
+| ExactlyOnceDelivery   | no        |       |
+| GuaranteedOrder       | no        |       |
+| Persistent            | no        |       |
+
+## Configuration
+
+### Publisher config
+
+```go
+type PublisherConfig struct {
+    // Writer is the destination io.Writer for published messages.
+    Writer io.Writer
+
+    // MarshalFunc controls how a Watermill message is encoded before
+    // writing it to the underlying Writer.
+    MarshalFunc MarshalMessageFunc
+}
+```
+
+### Subscriber config
+
+The subscriber can operate in two modes:
+
+- **Fixed-size reads** — reads blocks of `ReadBufferSize` bytes from the reader.
+- **Delimiter-based reads** — splits the byte stream on a configurable delimiter byte.
+
+Empty reads are not emitted as messages. The subscriber pauses for `PollInterval` after each empty read and then tries again, emulating a `tail -f` style continuous reader.
+
+```go
+type SubscriberConfig struct {
+    // Reader is the source io.Reader for incoming messages.
+    Reader io.Reader
+
+    // UnmarshalFunc controls how bytes read from the Reader are decoded
+    // into a Watermill message.
+    UnmarshalFunc UnmarshalMessageFunc
+
+    // PollInterval is the sleep duration after an empty read.
+    PollInterval time.Duration
+
+    // ReadBufferSize is the number of bytes to read per call (fixed-size mode).
+    // Ignored when Delimiter is set.
+    ReadBufferSize int
+
+    // Delimiter splits the byte stream into messages (delimiter mode).
+    // When set, ReadBufferSize is ignored.
+    Delimiter byte
+}
+```
+
+## Publisher setup
+
+```go
+import (
+    "os"
+
+    "github.com/ThreeDotsLabs/watermill"
+    wmio "github.com/ThreeDotsLabs/watermill-io/pkg/io"
+)
+
+publisher, err := wmio.NewPublisher(
+    wmio.PublisherConfig{
+        Writer:      os.Stdout,
+        MarshalFunc: wmio.PayloadMarshalFunc,
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+```
+
+## Subscriber setup
+
+```go
+import "os"
+
+subscriber, err := wmio.NewSubscriber(
+    wmio.SubscriberConfig{
+        Reader:         os.Stdin,
+        UnmarshalFunc:  wmio.PayloadUnmarshalFunc,
+        PollInterval:   100 * time.Millisecond,
+        Delimiter:      '\n',
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer subscriber.Close()
+```
+
+## Usage example
+
+The example below reads newline-delimited JSON from a file and writes each message to stdout:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "os"
+    "time"
+
+    "github.com/ThreeDotsLabs/watermill"
+    wmio "github.com/ThreeDotsLabs/watermill-io/pkg/io"
+    "github.com/ThreeDotsLabs/watermill/message"
+)
+
+func main() {
+    logger := watermill.NewStdLogger(false, false)
+
+    // Publisher writes messages to stdout
+    publisher, err := wmio.NewPublisher(
+        wmio.PublisherConfig{
+            Writer:      os.Stdout,
+            MarshalFunc: wmio.PayloadMarshalFunc,
+        },
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer publisher.Close()
+
+    // Subscriber reads newline-delimited lines from a file
+    f, err := os.Open("events.ndjson")
+    if err != nil {
+        panic(err)
+    }
+    defer f.Close()
+
+    subscriber, err := wmio.NewSubscriber(
+        wmio.SubscriberConfig{
+            Reader:        f,
+            UnmarshalFunc: wmio.PayloadUnmarshalFunc,
+            PollInterval:  50 * time.Millisecond,
+            Delimiter:     '\n',
+        },
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer subscriber.Close()
+
+    messages, err := subscriber.Subscribe(context.Background(), "file")
+    if err != nil {
+        panic(err)
+    }
+
+    for msg := range messages {
+        fmt.Printf("Line: %s\n", msg.Payload)
+
+        // Echo the line to stdout via the publisher
+        out := message.NewMessage(watermill.NewUUID(), msg.Payload)
+        publisher.Publish("stdout", out)
+
+        msg.Ack()
+    }
+}
+```
+
+## Emulating `tail -f`
+
+The subscriber's continuous polling makes it possible to follow a growing log file, similar to `tail -f`:
+
+```go
+// this will tail a log file and emit each line as a message
+logFile, _ := os.Open("/var/log/app.log")
+
+subscriber, _ := wmio.NewSubscriber(
+    wmio.SubscriberConfig{
+        Reader:        logFile,
+        UnmarshalFunc: wmio.PayloadUnmarshalFunc,
+        PollInterval:  200 * time.Millisecond,
+        Delimiter:     '\n',
+    },
+    logger,
+)
+```
+
+## Marshaling
+
+The `MarshalMessageFunc` and `UnmarshalMessageFunc` fully control the on-wire format. The package ships with two built-in helpers:
+
+| Function                 | Behaviour                                              |
+|--------------------------|--------------------------------------------------------|
+| `PayloadMarshalFunc`     | Writes only the message payload bytes to the writer    |
+| `PayloadUnmarshalFunc`   | Reads bytes and wraps them as the message payload      |
+
+Implement your own marshal/unmarshal pair when you need to encode UUID and metadata alongside the payload, or when the underlying reader/writer expects a specific format.
+
+## Topic semantics
+
+For this adapter, **the topic has no routing meaning**. The publisher always writes to the configured `io.Writer` and the subscriber always reads from the configured `io.Reader`, regardless of what topic string is passed. The topic is forwarded to the marshal/unmarshal functions so custom implementations can use it if needed.
+
+## Key considerations
+
+- **No persistence or durability** — data is streamed directly. If the writer drops a write or the reader misses data, messages are lost.
+- **Single reader/writer per instance** — each subscriber reads from one `io.Reader`; each publisher writes to one `io.Writer`. For multiple destinations, create multiple publisher instances.
+- **Experimental** — the API may change. For production workloads requiring reliability, use a dedicated broker backend.

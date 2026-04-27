@@ -1,0 +1,123 @@
+{
+  "projectType": "framework",
+  "projectName": "Watermill",
+  "projectDescription": "A Go library for building event-driven applications with a unified Publisher/Subscriber interface supporting Kafka, RabbitMQ, NATS, Redis, SQL, and more.",
+  "theme": "palm",
+  "primaryColor": "#7d604e",
+  "lightColor": "#1d1d1c",
+  "darkColor": "#b9ced5",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "getting-started",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/message",
+              "concepts/pub-sub",
+              "concepts/router",
+              "concepts/middleware"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/cqrs",
+              "advanced/metrics",
+              "advanced/forwarder",
+              "advanced/delayed-messages",
+              "advanced/fanin-fanout"
+            ]
+          },
+          {
+            "group": "Going Further",
+            "pages": [
+              "going-further/custom-pubsub",
+              "going-further/testing",
+              "going-further/troubleshooting",
+              "going-further/awesome"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Pub/Sub Backends",
+        "groups": [
+          {
+            "group": "Supported Backends",
+            "pages": [
+              "pubsubs/overview",
+              "pubsubs/kafka",
+              "pubsubs/amqp",
+              "pubsubs/nats",
+              "pubsubs/redis-stream",
+              "pubsubs/sql",
+              "pubsubs/google-cloud",
+              "pubsubs/http",
+              "pubsubs/gochannel",
+              "pubsubs/aws",
+              "pubsubs/firestore",
+              "pubsubs/bolt",
+              "pubsubs/io"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Unified Publisher/Subscriber interface across all backends",
+    "Router with handler middleware (retry, circuit breaker, poison queue, throttle, etc.)",
+    "CQRS component with EventBus, EventProcessor, CommandBus, CommandProcessor",
+    "Outbox pattern via Forwarder component for transactional publishing",
+    "Prometheus metrics integration with Grafana dashboard",
+    "At-least-once delivery with Ack/Nack mechanism",
+    "Fan-in and fan-out message routing patterns",
+    "Delayed message support",
+    "Extensive test suite for all Pub/Sub implementations including stress tests",
+    "Support for 12+ Pub/Sub backends: Kafka, RabbitMQ, NATS, Redis, SQL, GCP, AWS, HTTP, Bolt, Firestore"
+  ],
+  "publicApiSurface": [
+    "message.Publisher interface",
+    "message.Subscriber interface",
+    "message.Message struct",
+    "message.HandlerFunc type",
+    "message.NoPublishHandlerFunc type",
+    "message.HandlerMiddleware type",
+    "message.RouterPlugin type",
+    "message.NewRouter(config RouterConfig, logger LoggerAdapter) (*Router, error)",
+    "message.NewDefaultRouter(logger LoggerAdapter) *Router",
+    "Router.AddHandler(handlerName, subscribeTopic, subscriber, publishTopic, publisher, handlerFunc)",
+    "Router.AddNoPublisherHandler(handlerName, subscribeTopic, subscriber, handlerFunc)",
+    "Router.AddMiddleware(m ...HandlerMiddleware)",
+    "Router.Run(ctx context.Context) error",
+    "Router.Close() error",
+    "cqrs.EventBus.Publish(ctx, event) error",
+    "cqrs.EventProcessor.AddHandlers(handlers ...EventHandler)",
+    "cqrs.CommandBus.Send(ctx, cmd) error",
+    "cqrs.CommandProcessor.AddHandlers(handlers ...CommandHandler)",
+    "cqrs.NewEventHandler(handlerName, handlerFunc)",
+    "cqrs.NewCommandHandler(handlerName, handlerFunc)",
+    "middleware.Retry struct",
+    "middleware.CircuitBreaker struct",
+    "middleware.PoisonQueue",
+    "middleware.Recoverer",
+    "middleware.Throttle",
+    "middleware.Timeout",
+    "middleware.CorrelationID",
+    "middleware.Deduplicator",
+    "metrics.PrometheusMetricsBuilder",
+    "forwarder.Forwarder",
+    "watermill.NewStdLogger(debug, trace bool) LoggerAdapter",
+    "watermill.NewSlogLogger(handler slog.Handler) LoggerAdapter"
+  ]
+}

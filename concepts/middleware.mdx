@@ -1,0 +1,426 @@
+---
+title: "Middleware: adding cross-cutting behavior"
+description: "Middleware wraps handler functions to add retries, panic recovery, poison queues, throttling, and more — without cluttering your business logic."
+---
+
+Middleware in Watermill works exactly like an HTTP middleware: it wraps a handler function, executes logic before and/or after the handler, and can modify messages, swallow errors, or short-circuit processing entirely. Middleware is the right place for concerns that apply across many handlers — retrying on error, capturing panics, rate-limiting, tracing, and so on.
+
+## The HandlerMiddleware type
+
+```go
+// HandlerMiddleware allows writing decorators around HandlerFunc.
+// It can execute something before the handler (e.g. modify a consumed message)
+// or after (modify produced messages, ack/nack on consumed message, handle errors, logging, etc.).
+//
+// It can be attached to the router using AddMiddleware.
+//
+// Example:
+//
+//   func ExampleMiddleware(h message.HandlerFunc) message.HandlerFunc {
+//       return func(message *message.Message) ([]*message.Message, error) {
+//           fmt.Println("executed before handler")
+//           producedMessages, err := h(message)
+//           fmt.Println("executed after handler")
+//           return producedMessages, err
+//       }
+//   }
+type HandlerMiddleware func(h HandlerFunc) HandlerFunc
+```
+
+Every middleware is a function that takes a `HandlerFunc` and returns a new `HandlerFunc`. The inner `h` is the next middleware (or the actual handler) in the chain.
+
+## Adding middleware
+
+### Router-level middleware
+
+Router-level middleware runs for every handler registered on the router.
+
+```go
+router.AddMiddleware(
+    middleware.CorrelationID,
+    middleware.Retry{
+        MaxRetries:      3,
+        InitialInterval: time.Millisecond * 100,
+        Logger:          logger,
+    }.Middleware,
+    middleware.Recoverer,
+)
+```
+
+Middleware added first is executed first (outermost in the call stack). In the example above, `CorrelationID` wraps `Retry`, which wraps `Recoverer`, which wraps the handler.
+
+### Handler-level middleware
+
+Handler-level middleware runs only for a specific handler:
+
+```go
+handler := router.AddHandler(
+    "my_handler", "input-topic", sub, "output-topic", pub, myHandlerFunc,
+)
+
+handler.AddMiddleware(func(h message.HandlerFunc) message.HandlerFunc {
+    return func(msg *message.Message) ([]*message.Message, error) {
+        log.Println("executing handler-specific middleware for", msg.UUID)
+        return h(msg)
+    }
+})
+```
+
+## Built-in middleware
+
+All built-in middleware lives in `github.com/ThreeDotsLabs/watermill/message/router/middleware`.
+
+<AccordionGroup>
+  <Accordion title="Retry">
+    Retries the handler using exponential backoff if it returns an error.
+
+    ```go
+    // Retry provides middleware that retries the handler if errors are returned.
+    // The retry behaviour is configurable, with exponential backoff and maximum elapsed time.
+    type Retry struct {
+        // MaxRetries is the maximum number of times a retry will be attempted.
+        MaxRetries int
+
+        // InitialInterval is the first interval between retries.
+        // Subsequent intervals will be scaled by Multiplier.
+        InitialInterval time.Duration
+        // MaxInterval sets the limit for the exponential backoff of retries.
+        MaxInterval time.Duration
+        // Multiplier is the factor by which the waiting interval will be multiplied between retries.
+        Multiplier float64
+        // MaxElapsedTime sets the time limit of how long retries will be attempted. Disabled if 0.
+        MaxElapsedTime time.Duration
+        // RandomizationFactor randomizes the spread of backoff times within:
+        // [currentInterval * (1 - randomization_factor), currentInterval * (1 + randomization_factor)]
+        RandomizationFactor float64
+
+        // OnRetryHook is an optional function executed on each retry attempt.
+        OnRetryHook func(retryNum int, delay time.Duration)
+
+        // ShouldRetry is an optional function executed before each retry.
+        // Return false to stop retrying.
+        ShouldRetry func(params RetryParams) bool
+
+        // ResetContextOnRetry resets the message context on each retry attempt.
+        ResetContextOnRetry bool
+
+        Logger watermill.LoggerAdapter
+    }
+    ```
+
+    Usage:
+
+    ```go
+    middleware.Retry{
+        MaxRetries:      3,
+        InitialInterval: time.Millisecond * 100,
+        Multiplier:      2,
+        MaxElapsedTime:  time.Second * 10,
+        Logger:          logger,
+    }.Middleware
+    ```
+
+    After `MaxRetries` exhausted retries the message is Nacked, and the pub/sub backend decides whether to redeliver it.
+  </Accordion>
+
+  <Accordion title="Recoverer">
+    Catches panics in the handler, wraps them as errors, and returns them — preventing process crashes.
+
+    ```go
+    // Recoverer recovers from any panic in the handler and appends RecoveredPanicError
+    // with the stacktrace to any error returned from the handler.
+    func Recoverer(h message.HandlerFunc) message.HandlerFunc
+    ```
+
+    The error is an instance of `RecoveredPanicError`:
+
+    ```go
+    type RecoveredPanicError struct {
+        V          interface{} // the panicked value
+        Stacktrace string      // the full stack trace
+    }
+    ```
+
+    Place `Recoverer` as the innermost wrapper so that it catches panics from handlers and other middleware:
+
+    ```go
+    router.AddMiddleware(
+        middleware.Retry{MaxRetries: 3}.Middleware, // outer
+        middleware.Recoverer,                        // inner — catches panics from the handler
+    )
+    ```
+  </Accordion>
+
+  <Accordion title="PoisonQueue">
+    Salvages unprocessable messages by publishing them to a separate topic instead of retrying forever.
+
+    ```go
+    // PoisonQueue provides middleware that salvages unprocessable messages and
+    // publishes them on a separate topic. The main middleware chain then continues
+    // on, business as usual.
+    func PoisonQueue(pub message.Publisher, topic string) (message.HandlerMiddleware, error)
+
+    // PoisonQueueWithFilter is like PoisonQueue, but accepts a filter function
+    // to decide which errors qualify a message for the poison queue.
+    func PoisonQueueWithFilter(
+        pub message.Publisher,
+        topic string,
+        shouldGoToPoisonQueue func(err error) bool,
+    ) (message.HandlerMiddleware, error)
+    ```
+
+    Poisoned messages receive these metadata keys:
+
+    ```go
+    const (
+        ReasonForPoisonedKey  = "reason_poisoned"
+        PoisonedTopicKey      = "topic_poisoned"
+        PoisonedHandlerKey    = "handler_poisoned"
+        PoisonedSubscriberKey = "subscriber_poisoned"
+    )
+    ```
+
+    Usage:
+
+    ```go
+    poisonQueue, err := middleware.PoisonQueue(publisher, "poison-queue")
+    if err != nil {
+        panic(err)
+    }
+    router.AddMiddleware(poisonQueue)
+    ```
+  </Accordion>
+
+  <Accordion title="Throttle">
+    Limits the number of messages processed per unit of time to avoid overwhelming downstream systems.
+
+    ```go
+    // Throttle limits the amount of messages processed per unit of time.
+    type Throttle struct { /* unexported */ }
+
+    // NewThrottle creates a new Throttle middleware.
+    // Example: NewThrottle(10, time.Second) for 10 messages per second.
+    func NewThrottle(count int64, duration time.Duration) *Throttle
+
+    // Middleware returns the Throttle middleware.
+    func (t Throttle) Middleware(h message.HandlerFunc) message.HandlerFunc
+    ```
+
+    Usage:
+
+    ```go
+    // Allow at most 100 messages per second across all handlers
+    throttle := middleware.NewThrottle(100, time.Second)
+    router.AddMiddleware(throttle.Middleware)
+    ```
+
+    <Note>
+    The ticker is shared across all handlers that use the same `Throttle` instance. Create a new instance per handler if you need independent rate limits.
+    </Note>
+  </Accordion>
+
+  <Accordion title="Timeout">
+    Cancels the message context after a specified duration. Handlers that respect `msg.Context().Done()` will abort when the timeout fires.
+
+    ```go
+    // Timeout makes the handler cancel the incoming message's context after a specified time.
+    // Any timeout-sensitive functionality of the handler should listen on
+    // msg.Context().Done() to know when to fail.
+    func Timeout(timeout time.Duration) func(message.HandlerFunc) message.HandlerFunc
+    ```
+
+    Usage:
+
+    ```go
+    router.AddMiddleware(middleware.Timeout(time.Second * 30))
+    ```
+
+    Inside your handler, respect the context:
+
+    ```go
+    func myHandler(msg *message.Message) ([]*message.Message, error) {
+        select {
+        case result := <-expensiveOperation():
+            return processResult(result)
+        case <-msg.Context().Done():
+            return nil, msg.Context().Err()
+        }
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="CorrelationID">
+    Propagates a correlation ID from incoming messages to all messages the handler produces. Useful for distributed tracing.
+
+    ```go
+    // CorrelationIDMetadataKey is used to store the correlation ID in metadata.
+    const CorrelationIDMetadataKey = "correlation_id"
+
+    // CorrelationID adds the correlation ID to all messages produced by the handler.
+    // ID is based on the ID from the message received by the handler.
+    //
+    // SetCorrelationID must be called on the first message entering the system.
+    func CorrelationID(h message.HandlerFunc) message.HandlerFunc
+
+    // SetCorrelationID sets a correlation ID on the message.
+    // Should be called when the message first enters the system.
+    func SetCorrelationID(id string, msg *message.Message)
+
+    // MessageCorrelationID returns the correlation ID from the message.
+    func MessageCorrelationID(message *message.Message) string
+    ```
+
+    Usage:
+
+    ```go
+    // Set the ID on inbound messages (e.g. from an HTTP handler)
+    middleware.SetCorrelationID(requestID, msg)
+
+    // Add to router so all produced messages inherit the correlation ID
+    router.AddMiddleware(middleware.CorrelationID)
+    ```
+  </Accordion>
+
+  <Accordion title="CircuitBreaker">
+    Wraps the handler in a circuit breaker (backed by `github.com/sony/gobreaker`). When the handler keeps returning errors, the circuit opens and subsequent calls fail fast without calling the handler, preventing cascading failures.
+
+    ```go
+    // CircuitBreaker is middleware that wraps the handler in a circuit breaker.
+    // Based on configuration, it will fail fast if the handler keeps returning errors.
+    type CircuitBreaker struct { /* unexported */ }
+
+    // NewCircuitBreaker returns a new CircuitBreaker middleware.
+    // Refer to the gobreaker documentation for available settings.
+    func NewCircuitBreaker(settings gobreaker.Settings) CircuitBreaker
+
+    // Middleware returns the CircuitBreaker middleware.
+    func (c CircuitBreaker) Middleware(h message.HandlerFunc) message.HandlerFunc
+    ```
+
+    Usage:
+
+    ```go
+    cb := middleware.NewCircuitBreaker(gobreaker.Settings{
+        Name:        "my-handler",
+        MaxRequests: 1,
+        Interval:    time.Minute,
+        Timeout:     time.Minute * 5,
+    })
+    router.AddMiddleware(cb.Middleware)
+    ```
+  </Accordion>
+
+  <Accordion title="Deduplicator">
+    Drops messages that were seen recently, based on a hash of the payload. Useful for suppressing duplicates in at-least-once delivery scenarios.
+
+    ```go
+    // Deduplicator drops similar messages if they are present in an ExpiringKeyRepository.
+    // Similarity is determined by a MessageHasher.
+    //
+    // KeyFactory defaults to NewMessageHasherAdler32 with read limit math.MaxInt64.
+    // Repository defaults to NewMapExpiringKeyRepository with one minute retention.
+    // Timeout defaults to one minute.
+    type Deduplicator struct {
+        KeyFactory MessageHasher
+        Repository ExpiringKeyRepository
+        Timeout    time.Duration
+    }
+
+    // Middleware returns the HandlerMiddleware that drops duplicate messages.
+    func (d *Deduplicator) Middleware(h message.HandlerFunc) message.HandlerFunc
+    ```
+
+    Default usage (in-process, one minute deduplication window):
+
+    ```go
+    d := &middleware.Deduplicator{}
+    router.AddMiddleware(d.Middleware)
+    ```
+
+    Custom configuration:
+
+    ```go
+    repo, err := middleware.NewMapExpiringKeyRepository(5 * time.Minute)
+    if err != nil {
+        panic(err)
+    }
+    d := &middleware.Deduplicator{
+        KeyFactory: middleware.NewMessageHasherSHA256(middleware.MessageHasherReadLimitMinimum),
+        Repository: repo,
+        Timeout:    time.Second * 30,
+    }
+    router.AddMiddleware(d.Middleware)
+    ```
+
+    <Warning>
+    The default `MapExpiringKeyRepository` is in-process only. It cannot deduplicate messages across multiple service instances. For distributed deduplication, implement the `ExpiringKeyRepository` interface backed by Redis or a database.
+    </Warning>
+  </Accordion>
+
+  <Accordion title="InstantAck">
+    Acknowledges the message immediately, before the handler runs. This maximises throughput but weakens delivery guarantees.
+
+    ```go
+    // InstantAck makes the handler instantly acknowledge the incoming message,
+    // regardless of any errors.
+    // If you had exactly-once delivery, you may expect at-least-once instead.
+    // If you had ordered messages, the ordering might be broken.
+    func InstantAck(h message.HandlerFunc) message.HandlerFunc
+    ```
+
+    Usage:
+
+    ```go
+    router.AddMiddleware(middleware.InstantAck)
+    ```
+
+    <Warning>
+    Using `InstantAck` means that if the handler or process crashes, the message will **not** be redelivered. Only use it when you prefer throughput over reliability.
+    </Warning>
+  </Accordion>
+</AccordionGroup>
+
+## Writing custom middleware
+
+Any function that matches `func(h message.HandlerFunc) message.HandlerFunc` is valid middleware. Here is an annotated example:
+
+```go
+func LoggingMiddleware(h message.HandlerFunc) message.HandlerFunc {
+    return func(msg *message.Message) ([]*message.Message, error) {
+        start := time.Now()
+        log.Printf("handling message %s", msg.UUID)
+
+        // Call the next handler (or middleware) in the chain.
+        producedMessages, err := h(msg)
+
+        log.Printf("message %s handled in %s, err: %v", msg.UUID, time.Since(start), err)
+
+        // Return the produced messages and error unchanged.
+        // Middleware can modify them here if needed.
+        return producedMessages, err
+    }
+}
+```
+
+Register it like any other middleware:
+
+```go
+router.AddMiddleware(LoggingMiddleware)
+```
+
+If your middleware needs configuration, use a struct with a `Middleware` method — the same pattern used by `Retry`, `Throttle`, and `CircuitBreaker`:
+
+```go
+type RateLimitMiddleware struct {
+    limit rate.Limiter
+}
+
+func (r RateLimitMiddleware) Middleware(h message.HandlerFunc) message.HandlerFunc {
+    return func(msg *message.Message) ([]*message.Message, error) {
+        if err := r.limit.Wait(msg.Context()); err != nil {
+            return nil, err
+        }
+        return h(msg)
+    }
+}
+```

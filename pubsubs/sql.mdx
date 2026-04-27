@@ -1,0 +1,276 @@
+---
+title: "SQL Pub/Sub for MySQL and PostgreSQL"
+description: "Turn your existing MySQL or PostgreSQL database into a reliable message queue with Watermill's SQL backend and Outbox pattern support."
+---
+
+The SQL Pub/Sub executes standard SQL queries against a relational database, using it as a messaging system. This makes it a practical choice for applications that already have a SQL database but cannot yet introduce a dedicated broker, or for implementing the [Outbox pattern](https://watermill.io/docs/forwarder/) where messages must be persisted atomically alongside domain data.
+
+**MySQL** and **PostgreSQL** are supported. If you need SQLite, see the [watermill-sqlite](https://github.com/ThreeDotsLabs/watermill-sqlite) module.
+
+<Note>
+This backend lives in a separate module: [`github.com/ThreeDotsLabs/watermill-sql`](https://github.com/ThreeDotsLabs/watermill-sql). You need to install it in addition to the core `watermill` package.
+</Note>
+
+## Installation
+
+```bash
+go get github.com/ThreeDotsLabs/watermill-sql/v4
+```
+
+## Characteristics
+
+| Feature               | Supported | Notes                                                                    |
+|-----------------------|-----------|--------------------------------------------------------------------------|
+| ConsumerGroups        | yes       | Via `ConsumerGroup` in `SubscriberConfig` (not supported by queue schema)|
+| ExactlyOnceDelivery   | yes       |                                                                          |
+| GuaranteedOrder       | yes       |                                                                          |
+| Persistent            | yes       |                                                                          |
+
+## How it works
+
+The **publisher** inserts messages into a table using an `INSERT` statement. The **subscriber** polls the table with short-interval `SELECT` queries, advancing an offset pointer as messages are acknowledged. This makes the SQL Pub/Sub a good persistent event log — ideal for an Outbox pattern where a downstream forwarder relays messages to a faster broker.
+
+## Schema
+
+The SQL backend is fully configurable through the `SchemaAdapter` interface. Watermill provides default adapters for MySQL and PostgreSQL:
+
+- `DefaultMySQLSchema` — uses `BINARY(16)` for UUIDs and a standard offset column.
+- `DefaultPostgreSQLSchema` — uses `UUID` for UUIDs and leverages PostgreSQL transaction IDs to handle non-sequential commits.
+
+Pass the adapter to both `PublisherConfig` and `SubscriberConfig`:
+
+```go
+schemaAdapter := sql.DefaultMySQLSchema{
+    GenerateMessagesTableName: func(topic string) string {
+        return fmt.Sprintf("watermill_%s", topic)
+    },
+}
+```
+
+<Tip>
+You can extend a default schema instead of implementing it from scratch. Override only `SchemaInitializingQueries` and `UnmarshalMessage` when you need a custom column type, then delegate all other methods to the embedded default.
+</Tip>
+
+### Table structure (MySQL default)
+
+```sql
+CREATE TABLE IF NOT EXISTS watermill_events (
+    `offset`          BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    `uuid`            VARCHAR(36) NOT NULL,
+    `created_at`      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `payload`         JSON DEFAULT NULL,
+    `metadata`        JSON DEFAULT NULL,
+    `transaction_id`  BIGINT NOT NULL
+);
+```
+
+## Configuration
+
+### Publisher config
+
+```go
+type PublisherConfig struct {
+    // SchemaAdapter controls the SQL schema and marshaling.
+    SchemaAdapter SchemaAdapter
+
+    // AutoInitializeSchema creates the table on first publish if true.
+    AutoInitializeSchema bool
+}
+```
+
+### Subscriber config
+
+```go
+type SubscriberConfig struct {
+    // SchemaAdapter controls the SQL schema and unmarshaling.
+    SchemaAdapter SchemaAdapter
+
+    // OffsetsAdapter stores the subscriber's position in the message log.
+    OffsetsAdapter OffsetsAdapter
+
+    // InitializeSchema creates the table and offsets table if true.
+    InitializeSchema bool
+
+    // ConsumerGroup identifies this subscriber for offset tracking.
+    // Multiple subscribers with the same group name share work.
+    ConsumerGroup string
+
+    // PollInterval controls how often the subscriber polls for new messages.
+    PollInterval time.Duration
+
+    // ResendInterval controls how often unacked messages are retried.
+    ResendInterval time.Duration
+
+    // RetryInterval controls how long to wait before retrying after a DB error.
+    RetryInterval time.Duration
+
+    // BackoffManager controls the backoff strategy for polling.
+    BackoffManager BackoffManager
+}
+```
+
+## Publisher setup
+
+```go
+import (
+    "database/sql"
+
+    "github.com/ThreeDotsLabs/watermill"
+    watermillsql "github.com/ThreeDotsLabs/watermill-sql/v4/pkg/sql"
+    _ "github.com/go-sql-driver/mysql"
+)
+
+db, err := sql.Open("mysql", "user:pass@tcp(localhost:3306)/mydb")
+if err != nil {
+    panic(err)
+}
+
+publisher, err := watermillsql.NewPublisher(
+    db,
+    watermillsql.PublisherConfig{
+        SchemaAdapter:        watermillsql.DefaultMySQLSchema{},
+        AutoInitializeSchema: true,
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+```
+
+## Subscriber setup
+
+```go
+subscriber, err := watermillsql.NewSubscriber(
+    db,
+    watermillsql.SubscriberConfig{
+        SchemaAdapter:    watermillsql.DefaultMySQLSchema{},
+        OffsetsAdapter:   watermillsql.DefaultMySQLOffsetsAdapter{},
+        InitializeSchema: true,
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer subscriber.Close()
+```
+
+<Note>
+Use `DefaultMySQLOffsetsAdapter` with MySQL schemas and `DefaultPostgreSQLOffsetsAdapter` with PostgreSQL schemas. Mixing them will result in incorrect offset tracking.
+</Note>
+
+## Usage example
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+
+    "github.com/ThreeDotsLabs/watermill"
+    watermillsql "github.com/ThreeDotsLabs/watermill-sql/v4/pkg/sql"
+    "github.com/ThreeDotsLabs/watermill/message"
+    _ "github.com/go-sql-driver/mysql"
+)
+
+func main() {
+    db, _ := sql.Open("mysql", "user:pass@tcp(localhost:3306)/mydb")
+    logger := watermill.NewStdLogger(false, false)
+
+    publisher, err := watermillsql.NewPublisher(
+        db,
+        watermillsql.PublisherConfig{
+            SchemaAdapter:        watermillsql.DefaultMySQLSchema{},
+            AutoInitializeSchema: true,
+        },
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer publisher.Close()
+
+    subscriber, err := watermillsql.NewSubscriber(
+        db,
+        watermillsql.SubscriberConfig{
+            SchemaAdapter:    watermillsql.DefaultMySQLSchema{},
+            OffsetsAdapter:   watermillsql.DefaultMySQLOffsetsAdapter{},
+            InitializeSchema: true,
+        },
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer subscriber.Close()
+
+    msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"invoice_created"}`))
+    if err := publisher.Publish("invoices", msg); err != nil {
+        panic(err)
+    }
+
+    messages, err := subscriber.Subscribe(context.Background(), "invoices")
+    if err != nil {
+        panic(err)
+    }
+
+    for msg := range messages {
+        fmt.Printf("Received: %s\n", msg.Payload)
+        msg.Ack()
+    }
+}
+```
+
+## Transactional publishing
+
+To publish messages as part of a database transaction, pass a `*sql.Tx` to `NewPublisher`. Create a new publisher per transaction:
+
+```go
+tx, err := db.BeginTx(ctx, nil)
+if err != nil {
+    return err
+}
+
+txPublisher, err := watermillsql.NewPublisher(
+    tx,
+    watermillsql.PublisherConfig{SchemaAdapter: watermillsql.DefaultPostgreSQLSchema{}},
+    logger,
+)
+if err != nil {
+    tx.Rollback()
+    return err
+}
+
+// Publish and other DB writes happen atomically
+if err := txPublisher.Publish("events", msg); err != nil {
+    tx.Rollback()
+    return err
+}
+return tx.Commit()
+```
+
+## Queue schema
+
+Instead of the default pub/sub schema, you can use the queue schema adapters (`PostgreSQLQueueSchema` / `PostgreSQLQueueOffsetsAdapter`). The queue schema:
+
+- Supports a custom `WHERE` clause to filter messages by payload or metadata.
+- Can delete acknowledged messages, preventing unbounded table growth.
+- Does not support consumer groups.
+
+## PostgreSQL caveats
+
+PostgreSQL `SERIAL` values are allocated when a transaction starts, not when it commits. If two transactions commit in reverse order, their serial numbers will be out of sequence. Watermill handles this by also tracking the PostgreSQL transaction ID (`pg_current_xact_id()`), ensuring no messages are skipped.
+
+<Warning>
+Very long-running transactions will delay message delivery for all subscribers on that topic until the transaction commits. For such cases, use the [Queue schema](#queue-schema), which does not depend on transaction IDs.
+</Warning>
+
+## Key considerations
+
+- **Polling latency** — the subscriber polls on a configurable interval (`PollInterval`). This is not a push-based system; expect small delivery delays.
+- **Table growth** — without archival or the queue schema's delete-on-ack feature, message tables grow indefinitely.
+- **Examples** — see the [Watermill SQL example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/pubsubs/sql) for a runnable demo.

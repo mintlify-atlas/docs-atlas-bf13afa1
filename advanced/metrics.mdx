@@ -1,0 +1,184 @@
+---
+title: "Prometheus metrics for Watermill handlers"
+description: "Instrument publishers, subscribers, and router handlers with Prometheus metrics and serve a /metrics endpoint for scraping and Grafana dashboards."
+---
+
+Watermill's `components/metrics` package provides `PrometheusMetricsBuilder`, which decorates publishers, subscribers, and router handlers to record metrics into a Prometheus registry. A companion HTTP helper exposes the standard `/metrics` scrape endpoint.
+
+## PrometheusMetricsBuilder
+
+```go
+type PrometheusMetricsBuilder struct {
+    // PrometheusRegistry may be filled with a pre-existing Prometheus registry,
+    // or left empty for the default registry.
+    PrometheusRegistry prometheus.Registerer
+
+    Namespace string
+    Subsystem string
+
+    // PublishBuckets defines the histogram buckets for publish time.
+    // Defaults to Prometheus default buckets (5ms–10s) if nil.
+    PublishBuckets []float64
+
+    // HandlerBuckets defines the histogram buckets for handler execution time.
+    // Defaults to Watermill's values (one order of magnitude smaller: µs–ms range).
+    HandlerBuckets []float64
+}
+```
+
+Create a builder using an existing registry and optional namespace/subsystem prefix:
+
+```go
+metricsBuilder := metrics.NewPrometheusMetricsBuilder(prometheusRegistry, namespace, subsystem)
+```
+
+`Namespace` and `Subsystem` are forwarded to [`prometheus.BuildFQName`](https://godoc.org/github.com/prometheus/client_golang/prometheus#BuildFQName) as metric name prefixes. Leave them empty to use the default metric names without a prefix. If you set them, adjust any Grafana panel queries accordingly.
+
+## Exposing the /metrics endpoint
+
+Before decorating anything, create a registry and start the HTTP server:
+
+```go
+// CreateRegistryAndServeHTTP starts an HTTP server at addr, registers a /metrics endpoint,
+// and returns a new prometheus.Registry and a cancel function that stops the server.
+func CreateRegistryAndServeHTTP(addr string) (registry *prometheus.Registry, cancel func())
+
+// ServeHTTP registers /metrics on an existing registry and returns a cancel function.
+func ServeHTTP(addr string, registry *prometheus.Registry) (cancel func())
+```
+
+Typical usage:
+
+```go
+prometheusRegistry, closeMetricsServer := metrics.CreateRegistryAndServeHTTP(*metricsAddr)
+defer closeMetricsServer()
+
+metricsBuilder := metrics.NewPrometheusMetricsBuilder(prometheusRegistry, "", "")
+```
+
+## Wrapping a router (recommended)
+
+`AddPrometheusRouterMetrics` is the simplest approach. It wraps every handler, publisher, and subscriber that has been or will be added to the router:
+
+```go
+// AddPrometheusRouterMetrics decorates all publishers and subscribers on the router
+// and adds the metrics middleware to all handlers.
+func (b PrometheusMetricsBuilder) AddPrometheusRouterMetrics(r *message.Router)
+```
+
+Example from [`_examples/basic/4-metrics/main.go`](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/basic/4-metrics):
+
+```go
+prometheusRegistry, closeMetricsServer := metrics.CreateRegistryAndServeHTTP(*metricsAddr)
+defer closeMetricsServer()
+
+// leave namespace and subsystem empty to use default metric names
+metricsBuilder := metrics.NewPrometheusMetricsBuilder(prometheusRegistry, "", "")
+metricsBuilder.AddPrometheusRouterMetrics(router)
+```
+
+## Wrapping standalone publishers and subscribers
+
+For publishers or subscribers used outside a router (e.g., to produce or consume messages independently), decorate them individually:
+
+```go
+subWithMetrics, err := metricsBuilder.DecorateSubscriber(pubSub)
+if err != nil {
+    panic(err)
+}
+pubWithMetrics, err := metricsBuilder.DecoratePublisher(pub)
+if err != nil {
+    panic(err)
+}
+```
+
+These decorated instances report metrics with the label `handler_name=<no handler>` since they are not associated with a router handler.
+
+## Histogram bucket configuration
+
+Override the default buckets by setting `PublishBuckets` or `HandlerBuckets` on the builder before calling any decoration methods:
+
+```go
+metricsBuilder := metrics.NewPrometheusMetricsBuilder(registry, "", "")
+metricsBuilder.PublishBuckets = []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5}
+metricsBuilder.HandlerBuckets = []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1}
+```
+
+The defaults are:
+- **`PublishBuckets`** — standard Prometheus defaults (5ms–10s range).
+- **`HandlerBuckets`** — Watermill defaults, one order of magnitude smaller (µs–ms range), because handler execution is typically faster than a full network publish round-trip.
+
+## Exported metrics
+
+| Object | Metric | Type | Labels |
+|---|---|---|---|
+| Subscriber | `subscriber_messages_received_total` | Counter | `acked` ("acked"/"nacked"), `handler_name`, `subscriber_name` |
+| Handler | `handler_execution_time_seconds` | Histogram | `handler_name`, `success` ("true"/"false") |
+| Publisher | `publish_time_seconds` | Histogram | `success` ("true"/"false"), `handler_name`, `publisher_name` |
+
+Every metric also carries the `node` and `job` labels provided by Prometheus at scrape time.
+
+`subscriber_name` and `publisher_name` use the `String()` method if the type implements `fmt.Stringer`, otherwise `package.structName`.
+
+## Grafana dashboard
+
+A pre-built Grafana dashboard (ID **9777**) is available at [grafana.com/grafana/dashboards/9777](https://grafana.com/grafana/dashboards/9777). It shows throughput, failure rates, and handler/publish durations.
+
+To import it, go to **Dashboards → Import** in Grafana, enter ID `9777`, select your Prometheus data source that scrapes the `/metrics` endpoint, and click **Import**.
+
+<Note>
+If you set a non-empty `Namespace` or `Subsystem`, metric names will be prefixed and you will need to update the panel queries in the Grafana dashboard to match.
+</Note>
+
+## Full example
+
+The complete runnable example lives at [`_examples/basic/4-metrics`](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/basic/4-metrics). It includes a `docker-compose.yml` that starts Prometheus and Grafana, and a `prometheus.yml` scrape config. Follow the `README` in that directory to run it end-to-end.
+
+```go
+func main() {
+    flag.Parse()
+
+    pubSub := gochannel.NewGoChannel(gochannel.Config{}, logger)
+
+    router, err := message.NewRouter(message.RouterConfig{}, logger)
+    if err != nil {
+        panic(err)
+    }
+
+    prometheusRegistry, closeMetricsServer := metrics.CreateRegistryAndServeHTTP(*metricsAddr)
+    defer closeMetricsServer()
+
+    // we leave the namespace and subsystem empty
+    metricsBuilder := metrics.NewPrometheusMetricsBuilder(prometheusRegistry, "", "")
+    metricsBuilder.AddPrometheusRouterMetrics(router)
+
+    router.AddMiddleware(
+        middleware.Recoverer,
+        middleware.RandomFail(0.1),
+        middleware.RandomPanic(0.1),
+    )
+
+    router.AddHandler(
+        "metrics-example",
+        "sub_topic",
+        pubSub,
+        "pub_topic",
+        pubSub,
+        handler,
+    )
+
+    subWithMetrics, err := metricsBuilder.DecorateSubscriber(pubSub)
+    if err != nil {
+        panic(err)
+    }
+    pubWithMetrics, err := metricsBuilder.DecoratePublisher(pub)
+    if err != nil {
+        panic(err)
+    }
+
+    go produceMessages(routerClosed, pubWithMetrics)
+    go consumeMessages(subWithMetrics)
+
+    _ = router.Run(context.Background())
+}
+```

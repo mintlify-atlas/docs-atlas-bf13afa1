@@ -1,0 +1,104 @@
+---
+title: "Watermill: Building event-driven apps in Go"
+description: "Watermill is a Go library for working with message streams. Build event-driven apps, CQRS, sagas, and more on any Pub/Sub backend."
+---
+
+Watermill is a Go library for working efficiently with message streams. It gives you everything you need to build event-driven applications — from a simple publisher/subscriber API all the way up to CQRS — without locking you into a specific message broker. Just like `net/http` handles TCP so you don't have to, Watermill handles the complexity of messaging so you can focus on your business logic.
+
+## Goals
+
+Watermill was built around five core goals:
+
+- **Easy** to understand — a minimal API surface you can learn in minutes.
+- **Universal** — event-driven architecture, messaging, stream processing, CQRS — use it for whatever you need.
+- **Fast** — designed for high throughput (see benchmarks below).
+- **Flexible** — extend behavior with middlewares, plugins, and Pub/Sub configurations.
+- **Resilient** — built on proven technologies with stress-tested implementations.
+
+## Core interfaces
+
+Everything in Watermill builds on two interfaces defined in `message/pubsub.go`. A `Publisher` emits messages to a topic; a `Subscriber` consumes them.
+
+```go
+// Publisher is the emitting part of a Pub/Sub.
+type Publisher interface {
+	// Publish publishes provided messages to the given topic.
+	// Publish must be thread safe.
+	Publish(topic string, messages ...*Message) error
+	// Close should flush unsent messages if publisher is async.
+	Close() error
+}
+
+// Subscriber is the consuming part of the Pub/Sub.
+type Subscriber interface {
+	// Subscribe returns an output channel with messages from the provided topic.
+	// To receive the next message, Ack() must be called on the received message.
+	// If message processing fails, Nack() should be called instead.
+	Subscribe(ctx context.Context, topic string) (<-chan *Message, error)
+	// Close closes all subscriptions and flushes offsets when needed.
+	Close() error
+}
+```
+
+The handler function signature is the heart of Watermill's Router layer. A handler receives one message and optionally produces new ones:
+
+```go
+func(*Message) ([]*Message, error)
+```
+
+If the handler returns an error, the message is negatively acknowledged and will be redelivered according to your Pub/Sub's retry semantics.
+
+## Supported backends
+
+Watermill ships a built-in `GoChannel` implementation (no external dependencies). For production workloads, official adapters exist for the following backends:
+
+| Backend | Module |
+|---|---|
+| Kafka | `github.com/ThreeDotsLabs/watermill-kafka/v3` |
+| RabbitMQ (AMQP) | `github.com/ThreeDotsLabs/watermill-amqp/v3` |
+| AWS SNS/SQS | `github.com/ThreeDotsLabs/watermill-aws` |
+| Google Cloud Pub/Sub | `github.com/ThreeDotsLabs/watermill-googlecloud/v2` |
+| NATS JetStream | `github.com/ThreeDotsLabs/watermill-nats/v2` |
+| Redis Streams | `github.com/ThreeDotsLabs/watermill-redisstream` |
+| SQL (MySQL / PostgreSQL) | `github.com/ThreeDotsLabs/watermill-sql/v4` |
+| HTTP | `github.com/ThreeDotsLabs/watermill-http/v2` |
+| Bolt | `github.com/ThreeDotsLabs/watermill-bolt` |
+| SQLite (Beta) | `github.com/ThreeDotsLabs/watermill-sqlite` |
+
+Any backend that implements the `Publisher` and `Subscriber` interfaces works seamlessly with every other Watermill component — swap brokers without changing your handler code.
+
+## Benchmarks
+
+Numbers below are for 16-byte messages on a single 16-CPU VM running one binary with dependencies in Docker Compose. They are rough estimates; real-world results vary by configuration.
+
+| Pub/Sub | Publish (msg/s) | Subscribe (msg/s) |
+|---|---|---|
+| GoChannel | 315,776 | 138,743 |
+| Redis Streams | 59,158 | 12,134 |
+| NATS JetStream (16 subscribers) | 50,668 | 34,713 |
+| Kafka (one node) | 41,492 | 101,669 |
+| SQL (MySQL, batch=100) | 6,371 | 2,794 |
+| SQL (PostgreSQL, batch=1) | 2,831 | 9,460 |
+| Google Cloud Pub/Sub | 3,027 | 28,589 |
+| AMQP (RabbitMQ) | 2,770 | 14,604 |
+
+<Note>
+  Watermill v1.0.0 is production-ready. The public API is stable and will not change without a major version bump. All Pub/Sub implementations must pass a shared stress-test suite run 20× in parallel with the race detector enabled before merging.
+</Note>
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Get started" icon="rocket" href="/getting-started">
+    Install Watermill and walk through all three API layers with working code examples.
+  </Card>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Build your first working Watermill app step by step.
+  </Card>
+  <Card title="Pub/Sub backends" icon="server" href="/pubsubs/overview">
+    Learn how each supported backend works and when to choose it.
+  </Card>
+  <Card title="Core concepts" icon="book-open" href="/concepts/message">
+    Deep dive into Messages, the Router, middleware, and CQRS.
+  </Card>
+</CardGroup>

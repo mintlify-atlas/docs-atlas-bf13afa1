@@ -1,0 +1,220 @@
+---
+title: "Kafka Pub/Sub for Watermill"
+description: "Connect Watermill to Apache Kafka using the IBM Sarama-backed adapter. Supports consumer groups, key-based partitioning, and pluggable message marshalers."
+---
+
+Apache Kafka is one of the most widely adopted distributed streaming platforms. It excels at high-throughput, durable event streams where messages need to be replayed or consumed independently by multiple consumer groups. The Watermill Kafka adapter is backed by the [IBM Sarama](https://github.com/IBM/sarama) client library.
+
+<Note>
+This backend lives in a separate module: [`github.com/ThreeDotsLabs/watermill-kafka`](https://github.com/ThreeDotsLabs/watermill-kafka). You need to install it in addition to the core `watermill` package.
+</Note>
+
+## Installation
+
+```bash
+go get github.com/ThreeDotsLabs/watermill-kafka/v3
+```
+
+## Characteristics
+
+| Feature               | Supported | Notes                                                                                     |
+|-----------------------|-----------|-------------------------------------------------------------------------------------------|
+| ConsumerGroups        | yes       |                                                                                           |
+| ExactlyOnceDelivery   | no        | Achievable in theory with Kafka Transactions, but no current Go client support            |
+| GuaranteedOrder       | yes       | Requires [partition key usage](#partitioning)                                             |
+| Persistent            | yes       |                                                                                           |
+
+## Configuration
+
+The subscriber and publisher are configured through structs passed to their constructors. You can also supply a custom `*sarama.Config` to override any Sarama-level option; pass `nil` to use the built-in defaults.
+
+```go
+// SubscriberConfig holds configuration for the Kafka Subscriber.
+type SubscriberConfig struct {
+    // Kafka brokers list, e.g. []string{"localhost:9092"}
+    Brokers []string
+
+    // Unmarshaler translates Kafka messages into Watermill messages.
+    Unmarshaler Unmarshaler
+
+    // OverwriteSaramaConfig allows overriding the default Sarama config.
+    // When nil, DefaultSaramaSubscriberConfig() is used.
+    OverwriteSaramaConfig *sarama.Config
+
+    // Consumer group name. Leave empty to use an individual (non-group) consumer.
+    ConsumerGroup string
+
+    // How many partition-offset workers to run in parallel.
+    // Defaults to the number of partitions.
+    NackResendSleep time.Duration
+
+    // ReconnectRetrySleep is the sleep time between reconnect attempts.
+    ReconnectRetrySleep time.Duration
+
+    InitializeTopicDetails *sarama.TopicDetail
+}
+```
+
+### Default Sarama subscriber config
+
+When no custom Sarama config is supplied, Watermill uses sensible defaults:
+
+```go
+func DefaultSaramaSubscriberConfig() *sarama.Config {
+    config := sarama.NewConfig()
+    config.Version = sarama.V1_0_0_0
+    config.Consumer.Return.Errors = true
+    config.Consumer.Offsets.Initial = sarama.OffsetNewest
+    return config
+}
+```
+
+## Publisher setup
+
+```go
+import (
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-kafka/v3/pkg/kafka"
+)
+
+publisher, err := kafka.NewPublisher(
+    kafka.PublisherConfig{
+        Brokers:   []string{"localhost:9092"},
+        Marshaler: kafka.DefaultMarshaler{},
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer publisher.Close()
+```
+
+## Subscriber setup
+
+```go
+saramaConfig := kafka.DefaultSaramaSubscriberConfig()
+// Optional: tune consumer offset, session timeouts, etc.
+saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
+
+subscriber, err := kafka.NewSubscriber(
+    kafka.SubscriberConfig{
+        Brokers:               []string{"localhost:9092"},
+        Unmarshaler:           kafka.DefaultMarshaler{},
+        OverwriteSaramaConfig: saramaConfig,
+        ConsumerGroup:         "my-consumer-group",
+    },
+    watermill.NewStdLogger(false, false),
+)
+if err != nil {
+    panic(err)
+}
+defer subscriber.Close()
+```
+
+## Usage example
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill-kafka/v3/pkg/kafka"
+    "github.com/ThreeDotsLabs/watermill/message"
+)
+
+func main() {
+    logger := watermill.NewStdLogger(false, false)
+
+    publisher, err := kafka.NewPublisher(
+        kafka.PublisherConfig{
+            Brokers:   []string{"localhost:9092"},
+            Marshaler: kafka.DefaultMarshaler{},
+        },
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer publisher.Close()
+
+    subscriber, err := kafka.NewSubscriber(
+        kafka.SubscriberConfig{
+            Brokers:       []string{"localhost:9092"},
+            Unmarshaler:   kafka.DefaultMarshaler{},
+            ConsumerGroup: "example-group",
+        },
+        logger,
+    )
+    if err != nil {
+        panic(err)
+    }
+    defer subscriber.Close()
+
+    // Publish a message
+    msg := message.NewMessage(watermill.NewUUID(), []byte(`{"event":"user_signed_up"}`))
+    if err := publisher.Publish("user-events", msg); err != nil {
+        panic(err)
+    }
+
+    // Subscribe and consume
+    messages, err := subscriber.Subscribe(context.Background(), "user-events")
+    if err != nil {
+        panic(err)
+    }
+
+    for msg := range messages {
+        fmt.Printf("Received: %s\n", msg.Payload)
+        msg.Ack()
+    }
+}
+```
+
+## Marshaler
+
+Watermill messages must be serialized before being written to Kafka. The default `DefaultMarshaler` encodes the message UUID and metadata as Kafka headers and the payload as the message value.
+
+You can implement the `Marshaler` / `Unmarshaler` interfaces to use your own format (e.g. Protobuf, Avro):
+
+```go
+type Marshaler interface {
+    Marshal(topic string, msg *message.Message) (*sarama.ProducerMessage, error)
+}
+
+type Unmarshaler interface {
+    Unmarshal(*sarama.ConsumerMessage) (*message.Message, error)
+}
+```
+
+## Partitioning
+
+Kafka guarantees ordering only within a single partition. To route related messages to the same partition, use `GeneratePartitionKey` when creating the publisher:
+
+```go
+marshaler := kafka.NewWithPartitioningMarshaler(func(topic string, msg *message.Message) (string, error) {
+    return msg.Metadata.Get("user_id"), nil
+})
+
+publisher, err := kafka.NewPublisher(
+    kafka.PublisherConfig{
+        Brokers:   []string{"localhost:9092"},
+        Marshaler: marshaler,
+    },
+    logger,
+)
+```
+
+<Warning>
+If the metadata key used for partitioning is missing, an empty string is used as the partition key. All such messages will land in the same partition, which may cause uneven load distribution.
+</Warning>
+
+## Key considerations
+
+- **At-least-once delivery** — Kafka does not deduplicate messages. Design consumers to be idempotent.
+- **Ordered delivery** — guaranteed per partition. Use a consistent partition key for messages that must be processed in order.
+- **Consumer groups** — multiple instances with the same `ConsumerGroup` share work. Use different group names when each instance must see every message.
+- **Topic auto-creation** — pass `InitializeTopicDetails` in `SubscriberConfig` to let Watermill create topics automatically.
+- **Examples** — see the [Watermill Kafka example](https://github.com/ThreeDotsLabs/watermill/tree/master/_examples/pubsubs/kafka) for a runnable demo.

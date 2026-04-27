@@ -1,81 +1,336 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
-icon: 'rocket'
+title: "Quickstart: Your first Watermill app"
+description: "Build a working event-driven Go app from scratch using Watermill's Router, GoChannel pub/sub, and JSON message payloads — no external services required."
 ---
 
-## Get started in three steps
+This quickstart walks you through building a complete Watermill application from scratch. You will create a Router with a real handler, publish structured events, and process them — all using the built-in `GoChannel` pub/sub so there is nothing to install beyond Go itself. By the end you will understand how messages flow through a Watermill application and how Ack/Nack signals control redelivery.
 
-Get your documentation site running locally and make your first customization.
+The finished code is available at [`_examples/basic/1-your-first-app/main.go`](https://github.com/ThreeDotsLabs/watermill/blob/master/_examples/basic/1-your-first-app/main.go) on GitHub.
 
-### Step 1: Set up your local environment
+## Prerequisites
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+- Go 1.21 or later
+- Basic familiarity with Go modules and goroutines
 
-### Step 2: Deploy your changes
+## Build the app
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+<Steps>
+  <Step title="Install Watermill">
+    Create a new module and fetch Watermill:
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    ```bash
+    mkdir watermill-app && cd watermill-app
+    go mod init watermill-app
+    go get github.com/ThreeDotsLabs/watermill
+    ```
+  </Step>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+  <Step title="Define your message types">
+    Create `main.go` and define the structs for the events this app will produce and consume. Using typed structs with JSON keeps payloads readable and safe.
 
-### Step 3: Go live
+    ```go
+    package main
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    import (
+        "context"
+        "encoding/json"
+        "fmt"
+        "time"
+
+        "github.com/ThreeDotsLabs/watermill"
+        "github.com/ThreeDotsLabs/watermill/message"
+        "github.com/ThreeDotsLabs/watermill/message/router/middleware"
+        "github.com/ThreeDotsLabs/watermill/message/router/plugin"
+        "github.com/ThreeDotsLabs/watermill/pubsub/gochannel"
+    )
+
+    var (
+        consumeTopic = "events"
+        publishTopic = "events-processed"
+
+        logger = watermill.NewStdLogger(
+            true,  // debug
+            false, // trace
+        )
+    )
+
+    type event struct {
+        ID int `json:"id"`
+    }
+
+    type processedEvent struct {
+        ProcessedID int       `json:"processed_id"`
+        Time        time.Time `json:"time"`
+    }
+    ```
+  </Step>
+
+  <Step title="Create the Router">
+    The Router is the central piece of a Watermill application. It wires subscribers to handlers, manages goroutines, and handles graceful shutdown. `plugin.SignalsHandler` shuts it down cleanly when `SIGTERM` is received. `middleware.Recoverer` converts panics into errors so they can be handled by retry logic.
+
+    ```go
+    func main() {
+        pubSub := gochannel.NewGoChannel(gochannel.Config{}, logger)
+
+        router, err := message.NewRouter(message.RouterConfig{}, logger)
+        if err != nil {
+            panic(err)
+        }
+
+        router.AddPlugin(plugin.SignalsHandler)
+        router.AddMiddleware(middleware.Recoverer)
+    ```
+  </Step>
+
+  <Step title="Register a handler">
+    A handler binds an input topic and subscriber to an output topic and publisher, with a function that transforms messages. The function signature `func(*message.Message) ([]*message.Message, error)` is the core contract: return new messages to publish, or return an error to signal a processing failure.
+
+    ```go
+        // Adding a handler (multiple handlers can be added)
+        router.AddHandler(
+            "handler_1",  // handler name, must be unique
+            consumeTopic, // topic from which messages should be consumed
+            pubSub,
+            publishTopic, // topic to which messages should be published
+            pubSub,
+            func(msg *message.Message) ([]*message.Message, error) {
+                consumedPayload := event{}
+                err := json.Unmarshal(msg.Payload, &consumedPayload)
+                if err != nil {
+                    // When a handler returns an error, the default behavior is to send a Nack
+                    // (negative-acknowledgement). The message will be processed again.
+                    //
+                    // You can change the default behaviour by using middlewares, like Retry or PoisonQueue.
+                    // You can also implement your own middleware.
+                    return nil, err
+                }
+
+                fmt.Printf("received event %+v\n", consumedPayload)
+
+                newPayload, err := json.Marshal(processedEvent{
+                    ProcessedID: consumedPayload.ID,
+                    Time:        time.Now(),
+                })
+                if err != nil {
+                    return nil, err
+                }
+
+                newMessage := message.NewMessage(watermill.NewUUID(), newPayload)
+
+                return []*message.Message{newMessage}, nil
+            },
+        )
+    ```
+
+    <Note>
+      The example uses one `pubSub` value for both the subscriber and publisher because `GoChannel` implements both interfaces. In production you would typically pass a dedicated subscriber and publisher backed by different (or the same) broker instances.
+    </Note>
+  </Step>
+
+  <Step title="Simulate incoming events">
+    In a real application, events arrive from an external system. Here a goroutine publishes one event per second to simulate incoming traffic. Each message gets a UUID (useful for tracing) and a JSON-encoded payload.
+
+    ```go
+        // Simulate incoming events in the background
+        go simulateEvents(pubSub)
+
+        if err := router.Run(context.Background()); err != nil {
+            panic(err)
+        }
+    }
+
+    // simulateEvents produces events that will be later consumed.
+    func simulateEvents(publisher message.Publisher) {
+        i := 0
+        for {
+            e := event{
+                ID: i,
+            }
+
+            payload, err := json.Marshal(e)
+            if err != nil {
+                panic(err)
+            }
+
+            err = publisher.Publish(consumeTopic, message.NewMessage(
+                watermill.NewUUID(), // internal uuid of the message, useful for debugging
+                payload,
+            ))
+            if err != nil {
+                panic(err)
+            }
+
+            i++
+
+            time.Sleep(time.Second)
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="Run the app">
+    ```bash
+    go run main.go
+    ```
+
+    You should see log output similar to:
+
+    ```
+    received event {ID:0}
+    received event {ID:1}
+    received event {ID:2}
+    ```
+
+    Press `Ctrl+C` to trigger a graceful shutdown via `SIGTERM`.
+  </Step>
+</Steps>
+
+## Understanding Ack and Nack
+
+Every message received from a `Subscriber` must be either acknowledged or negatively acknowledged. This is how Watermill (and the underlying Pub/Sub) knows whether to deliver the next message.
+
+| Call | Meaning | What happens next |
+|---|---|---|
+| `msg.Ack()` | Processing succeeded. | The next message is delivered. |
+| `msg.Nack()` | Processing failed. | The message is redelivered (behavior depends on the Pub/Sub). |
+
+When using the Router, you rarely call `Ack` or `Nack` directly. The Router calls `Ack` automatically when your handler returns `nil`, and `Nack` when it returns an error.
+
+```go
+// Ack is sent automatically when the handler returns nil.
+return []*message.Message{newMessage}, nil
+
+// Nack is sent automatically when the handler returns an error.
+// The message will be redelivered.
+return nil, fmt.Errorf("failed to process message: %w", err)
+```
+
+<Tip>
+  Use middleware like `middleware.Retry` to automatically retry failed messages a configurable number of times before giving up, and `middleware.PoisonQueue` to route permanently-failing messages to a dead-letter topic.
+</Tip>
+
+## Complete source
+
+Here is the full `main.go` using GoChannel in place of Kafka, making it runnable with no external dependencies:
+
+```go
+package main
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "time"
+
+    "github.com/ThreeDotsLabs/watermill"
+    "github.com/ThreeDotsLabs/watermill/message"
+    "github.com/ThreeDotsLabs/watermill/message/router/middleware"
+    "github.com/ThreeDotsLabs/watermill/message/router/plugin"
+    "github.com/ThreeDotsLabs/watermill/pubsub/gochannel"
+)
+
+var (
+    consumeTopic = "events"
+    publishTopic = "events-processed"
+
+    logger = watermill.NewStdLogger(
+        true,  // debug
+        false, // trace
+    )
+)
+
+type event struct {
+    ID int `json:"id"`
+}
+
+type processedEvent struct {
+    ProcessedID int       `json:"processed_id"`
+    Time        time.Time `json:"time"`
+}
+
+func main() {
+    pubSub := gochannel.NewGoChannel(gochannel.Config{}, logger)
+
+    router, err := message.NewRouter(message.RouterConfig{}, logger)
+    if err != nil {
+        panic(err)
+    }
+
+    router.AddPlugin(plugin.SignalsHandler)
+    router.AddMiddleware(middleware.Recoverer)
+
+    router.AddHandler(
+        "handler_1",
+        consumeTopic,
+        pubSub,
+        publishTopic,
+        pubSub,
+        func(msg *message.Message) ([]*message.Message, error) {
+            consumedPayload := event{}
+            err := json.Unmarshal(msg.Payload, &consumedPayload)
+            if err != nil {
+                return nil, err
+            }
+
+            fmt.Printf("received event %+v\n", consumedPayload)
+
+            newPayload, err := json.Marshal(processedEvent{
+                ProcessedID: consumedPayload.ID,
+                Time:        time.Now(),
+            })
+            if err != nil {
+                return nil, err
+            }
+
+            newMessage := message.NewMessage(watermill.NewUUID(), newPayload)
+            return []*message.Message{newMessage}, nil
+        },
+    )
+
+    go simulateEvents(pubSub)
+
+    if err := router.Run(context.Background()); err != nil {
+        panic(err)
+    }
+}
+
+func simulateEvents(publisher message.Publisher) {
+    i := 0
+    for {
+        e := event{ID: i}
+
+        payload, err := json.Marshal(e)
+        if err != nil {
+            panic(err)
+        }
+
+        err = publisher.Publish(consumeTopic, message.NewMessage(
+            watermill.NewUUID(),
+            payload,
+        ))
+        if err != nil {
+            panic(err)
+        }
+
+        i++
+        time.Sleep(time.Second)
+    }
+}
+```
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Get started guide" icon="book-open" href="/getting-started">
+    Explore the Publisher/Subscriber layer and the Router API in more depth.
+  </Card>
+  <Card title="Router and middleware" icon="shuffle" href="/concepts/router">
+    Learn about correlation IDs, retries, poison queues, throttling, and more.
+  </Card>
+  <Card title="CQRS" icon="layers" href="/advanced/cqrs">
+    Level up to the typed command and event bus for domain-driven designs.
+  </Card>
+  <Card title="Pub/Sub backends" icon="server" href="/pubsubs/overview">
+    Swap GoChannel for Kafka, RabbitMQ, PostgreSQL, or any other supported backend.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
